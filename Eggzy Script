@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.98-inputfix",
+    BuildNote = "v1.7.99-qwatch",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -1398,7 +1398,31 @@ task.spawn(function()
                 if part and dist <= cfg.SpamRange and os.clock() >= nextPress then
                     pressKey(cfg.SpamKey, cfg.SpamHold)
                     nextPress = os.clock() + cfg.SpamPeriod
+                    cfg.lastPress = os.clock()
                 end
+            end
+        end
+        -- Stall watchdog: a boss is alive and armed but no Q went out for 3 periods. Print why, then reset the input state.
+        if cfg.SpamQ and boss and os.clock() > armedAt then
+            local lastGood = math.max(cfg.lastPress or 0, armedAt)
+            if os.clock() - lastGood > cfg.SpamPeriod * 3 and os.clock() - (cfg.lastDiag or 0) > 10 then
+                cfg.lastDiag = os.clock()
+                local rootD = getRoot()
+                local partD, distD
+                if rootD then partD, distD = livingBossPart(boss, rootD.Position) end
+                print(string.format("[EggzyQ] STALL boss=%s windowFocused=%s textBox=%s busyFor=%s heldKeys=%s part=%s dist=%s range=%s",
+                    tostring(boss), tostring(windowFocused), tostring(UserInputService:GetFocusedTextBox()),
+                    pressing and string.format("%.1fs", os.clock() - pressing) or "no",
+                    tostring(next(heldKeys) ~= nil), tostring(partD ~= nil),
+                    distD and string.format("%.0f", distD) or "?", tostring(cfg.SpamRange)))
+                forceReleaseInputs()
+                pressing = false
+                windowFocused = true
+                pcall(function()
+                    local tb = UserInputService:GetFocusedTextBox()
+                    if tb then tb:ReleaseFocus() end
+                end)
+                nextPress = 0
             end
         end
         task.wait(0.2)
