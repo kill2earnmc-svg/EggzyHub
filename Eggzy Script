@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.119-maxlvlpres",
+    BuildNote = "v1.7.120-autostats",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 119 },
+    Version = { Tweaks = 120 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3889,6 +3889,67 @@ do
     createToggle(body, "Auto Rank Up", 2, function() return State.AutoRank end, function(v)
         State.AutoRank = v
     end)
+end
+
+do
+    -- Auto Stats: LocalPlayer.startevent:FireServer("addstat", <stat>, 1), captured with WrenchSpy for chakra, ninjutsu, taijutsu, health.
+    -- Pure remote call, never moves the player. Where the unspent point count lives is NOT known, so it fires on a timer; the server decides
+    -- whether a point is available. Interval is an ASSUMED pause between fires. Stats outside the four captured ones are not offered.
+    Config.Stats = { Names = { "chakra", "ninjutsu", "taijutsu", "health" }, Amount = 1, Interval = 0.3 }
+    State.AutoStats = false
+    State.StatPick = {}
+    local ST = { index = 0, lastFire = 0 }
+
+    function ST.fire(stat)
+        local remote = LocalPlayer:FindFirstChild("startevent")
+        if not remote or not remote:IsA("RemoteEvent") then
+            print("[EggzyStats] LocalPlayer.startevent not found")
+            return false
+        end
+        local okFire, err = pcall(function() remote:FireServer("addstat", stat, Config.Stats.Amount) end)
+        if not okFire then
+            print("[EggzyStats] fire failed: " .. tostring(err))
+            return false
+        end
+        return true
+    end
+
+    -- next picked stat in round-robin order, nil when none is picked
+    function ST.nextStat()
+        local names = Config.Stats.Names
+        for _ = 1, #names do
+            ST.index = ST.index % #names + 1
+            local name = names[ST.index]
+            if State.StatPick[name] then return name end
+        end
+        return nil
+    end
+
+    task.spawn(function()
+        while Alive do
+            if State.AutoStats and os.clock() - ST.lastFire >= Config.Stats.Interval then
+                local stat = ST.nextStat()
+                if stat then
+                    ST.fire(stat)
+                    ST.lastFire = os.clock()
+                end
+            end
+            task.wait(0.1)
+        end
+    end)
+
+    local card, body = createCard(autoPage, "Auto Stats", 5)
+    createToggle(body, "Auto Stats", 1, function() return State.AutoStats end, function(v)
+        State.AutoStats = v
+    end)
+    for i, name in ipairs(Config.Stats.Names) do
+        createToggle(body, "  " .. name:sub(1, 1):upper() .. name:sub(2), 1 + i, function() return State.StatPick[name] == true end, function(v)
+            State.StatPick[name] = v or nil
+        end)
+    end
+    createValueRow(body, "Seconds between points", function() return Config.Stats.Interval end, function(v)
+        Config.Stats.Interval = v
+    end, 0.1, 0.1, 5, 1 + #Config.Stats.Names + 1)
 end
 
 do
