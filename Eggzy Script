@@ -62,7 +62,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.79-mentor",
+    BuildNote = "v1.7.80-mentor",
     Debug = true,
     PanicKey = Enum.KeyCode.End,
     ToggleKey = Enum.KeyCode.RightShift,
@@ -168,7 +168,7 @@ local Config = {
             Poll          = 0.1,
         },
         Training5 = {                    -- quest 5: mentor fight in the other server
-            Depth        = 90,          -- from you: stand 90 studs under the boss
+            Depth        = 60,          -- was 90 (your first ask); 60 because the boss fell through the map at 90. 60 is my pick, uncalibrated; same distance the grind uses for some bosses
             BossFolder   = "npc",       -- ASSUMED: same folder the grind uses; unverified in the mentor-fight server (falls back to Workspace children)
             TeleportWait = 60,          -- seconds to wait for the server teleport after talking before talking again (uncalibrated)
             ResumeFile   = "EggzyResume.txt", -- flag file written when the fight-server teleport is expected; survives the teleport
