@@ -13,6 +13,28 @@ local VirtualUser = game:GetService("VirtualUser")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local okVim, VIM = pcall(game.GetService, game, "VirtualInputManager")
 
+-- Everything the hub prints is also kept in EggzyHub_log.txt (last 400 lines, survives server teleports),
+-- so one file shows what happened before and after a teleport.
+local rawPrint = print
+local LOG_FILE = "EggzyHub_log.txt"
+local logBuf = {}
+if isfile and readfile and isfile(LOG_FILE) then
+    local okR, old = pcall(readfile, LOG_FILE)
+    if okR and type(old) == "string" then
+        for line in old:gmatch("[^\n]+") do logBuf[#logBuf + 1] = line end
+        while #logBuf > 300 do table.remove(logBuf, 1) end
+    end
+end
+local function print(...)
+    rawPrint(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    logBuf[#logBuf + 1] = os.date("%X") .. " " .. table.concat(parts, " ")
+    while #logBuf > 400 do table.remove(logBuf, 1) end
+    if writefile then pcall(writefile, LOG_FILE, table.concat(logBuf, "\n")) end
+end
+print("---- EggzyHub started | place " .. tostring(game.PlaceId) .. " | job " .. tostring(game.JobId))
+
 local questFolder
 
 -- ===================== CONFIG =====================
@@ -62,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.90-quest-check",
+    BuildNote = "v1.7.91-log",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
