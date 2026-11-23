@@ -62,7 +62,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.89-scroll",
+    BuildNote = "v1.7.90-quest-check",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -169,6 +169,7 @@ local Config = {
             MaxFails      = 3,          -- consecutive failed rounds before talking to the mentor again
             Poll          = 0.1,
         },
+        QuestSnapshotFile = "EggzyQuestSnapshot.txt", -- written after every talk and in the fight server; shows what the game exposes about the current quest
         Training5 = {                    -- quest 5: mentor fight in the other server
             QPeriod      = 5,           -- from you: press Q every 5 seconds while the boss is alive
             Offset       = 30,          -- from you: 30 studs ABOVE the boss (positive = above, negative = under; it was 90 then 60 under)
@@ -2194,7 +2195,9 @@ function T3.markResume()
     local t = Config.Mentor.Training5
     local okE, genv = pcall(getgenv)
     if okE and genv then genv.EggzyResume = "t5" end
-    if writefile then pcall(writefile, t.ResumeFile, tostring(os.time())) end
+    -- time | PlaceId | JobId | mentor name: lets the new server prove it is a different server and know who to fight
+    local payload = table.concat({ tostring(os.time()), tostring(game.PlaceId), tostring(game.JobId), tostring(MentorInfo.name or "") }, "|")
+    if writefile then pcall(writefile, t.ResumeFile, payload) end
 end
 
 function T3.clearResume()
@@ -2208,17 +2211,75 @@ function T3.clearResume()
     end
 end
 
--- true when the flag file was written recently; always consumes (clears) it
+-- Reads and consumes the flag file. Returns fresh, info, why.
+-- fresh = written recently AND we are in a different server (JobId changed), i.e. we were teleported, not just re-executed.
 function T3.takeResumeFlag()
     local t = Config.Mentor.Training5
-    local fresh = false
+    local fresh, info, why = false, nil, "no flag file"
     if isfile and readfile and isfile(t.ResumeFile) then
         local okR, txt = pcall(readfile, t.ResumeFile)
-        local ts = okR and tonumber(txt)
-        if ts and math.abs(os.time() - ts) <= t.ResumeWindow then fresh = true end
+        if okR and type(txt) == "string" then
+            local ts, placeId, jobId, name = txt:match("^(%d+)|([^|]*)|([^|]*)|(.*)$")
+            if not ts then ts = txt:match("^(%d+)$") end
+            ts = tonumber(ts)
+            if ts and ts > 0 then
+                info = { ts = ts, placeId = placeId, jobId = jobId, name = (name and name ~= "") and name or nil }
+                if math.abs(os.time() - ts) > t.ResumeWindow then
+                    why = "flag is older than " .. t.ResumeWindow .. " s"
+                elseif jobId and jobId ~= "" and jobId == tostring(game.JobId) then
+                    why = "same server (JobId unchanged), not a teleport"
+                else
+                    fresh, why = true, string.format("teleported: JobId changed, place %s -> %s", tostring(placeId), tostring(game.PlaceId))
+                end
+            else
+                why = "flag file empty"
+            end
+        end
     end
     T3.clearResume()
-    return fresh
+    return fresh, info, why
+end
+
+function T3.playerMentorName()
+    local ok, cands = pcall(mentorCandidates)
+    if not ok then return nil end
+    table.sort(cands, function(a, b) return (a.kw and 1 or 0) > (b.kw and 1 or 0) end)
+    for _, c in ipairs(cands) do
+        if c.kw and type(c.raw) == "string" and c.raw ~= "" then return c.raw end
+    end
+    return nil
+end
+
+-- Writes what the player's data and mission UI look like right now, so the "which quest am I on" source can be found.
+T3.snapLog = {}
+function T3.questSnapshot(tag)
+    local lines = { string.format("== %s | %s | place %s job %s", tostring(tag), os.date("%X"), tostring(game.PlaceId), tostring(game.JobId)) }
+    local statz = LocalPlayer:FindFirstChild("statz")
+    if statz then
+        for _, v in ipairs(statz:GetChildren()) do
+            if v:IsA("ValueBase") and #lines < 120 then lines[#lines + 1] = "statz." .. v.Name .. " = " .. tostring(v.Value) end
+        end
+    end
+    for k, v in pairs(LocalPlayer:GetAttributes()) do
+        if #lines < 160 then lines[#lines + 1] = "attr " .. tostring(k) .. " = " .. tostring(v) end
+    end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        local n = 0
+        for _, d in ipairs(pg:GetDescendants()) do
+            if n >= 40 then break end
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible and d.Text ~= "" then
+                local l = d.Text:lower()
+                if l:find("training") or l:find("mission") or l:find("quest") or l:find("mentor") or l:find("sensei") then
+                    n += 1
+                    lines[#lines + 1] = "gui " .. d:GetFullName() .. ": " .. d.Text:sub(1, 90)
+                end
+            end
+        end
+    end
+    T3.snapLog[#T3.snapLog + 1] = table.concat(lines, "\n")
+    if writefile then pcall(writefile, Config.Mentor.QuestSnapshotFile, table.concat(T3.snapLog, "\n\n")) end
+    if Config.Debug then print("[EggzyMentor] quest snapshot saved: " .. tostring(tag)) end
 end
 
 function T3.queueReload()
@@ -2242,8 +2303,9 @@ end
 function T3.fight()
     local t, g = Config.Mentor.Training5, Config.Grind
     local function stillOn() return Alive and State.Mentor and not State.Grind end
-    local okName, mentorName = pcall(detectMentorName)
-    if not (okName and mentorName) then mentorName = MentorInfo.name end
+    local mentorName = T3.resumeName or MentorInfo.name or T3.playerMentorName()
+    local announced = false
+    T3.questSnapshot("fight server start (mentor " .. tostring(mentorName) .. ")")
 
     State.Fly = true
     State.Noclip = true
@@ -2264,6 +2326,12 @@ function T3.fight()
             local model, hum, part = T3.findFightBoss(mentorName)
             if model then
                 sawBoss = true
+                if not announced then
+                    announced = true
+                    local match = mentorName and model.Name:lower():find(mentorName:lower(), 1, true) ~= nil
+                    print(string.format("[EggzyMentor] fight check: boss candidate %s | mentor %s | name match %s | mentor folder here: %s",
+                        model.Name, tostring(mentorName), tostring(match), tostring(mentorMissionsFolder() ~= nil)))
+                end
                 -- dead = gone from the world, or died by itself (a Health 0 that WE wrote does not count)
                 if not model.Parent or (hum.Health <= 0 and not scriptZeroed[hum]) then
                     return string.format("boss %s is dead", model.Name)
@@ -2374,9 +2442,14 @@ end
 
 do
     local okE, genv = pcall(getgenv)
-    local byFlag = T3.takeResumeFlag()
-    if (okE and genv and genv.EggzyResume == "t5") or byFlag then
+    local byGenv = okE and genv and genv.EggzyResume == "t5" -- read before takeResumeFlag clears it
+    local byFlag, flagInfo, flagWhy = T3.takeResumeFlag()
+    if Config.Debug and (byFlag or byGenv or flagInfo) then
+        print(string.format("[EggzyMentor] resume check: flag=%s (%s) | queued flag=%s", tostring(byFlag), tostring(flagWhy), tostring(byGenv)))
+    end
+    if byFlag or (byGenv and not (flagInfo and not byFlag)) then
         if okE and genv then genv.EggzyResume = nil end
+        T3.resumeName = flagInfo and flagInfo.name or nil
         Config.Mentor.Mission = 5
         State.Mentor = true
         T3.resume = true
@@ -2423,6 +2496,8 @@ task.spawn(function()
                         stopFaceLock()
                         local ok = pcall(function() remote:FireServer(LocalPlayer) end)
                         if ok then
+                            local tagMission = m.Mission
+                            task.delay(2, function() pcall(T3.questSnapshot, "2 s after talking, hub training " .. tagMission) end)
                             phase, presses = (m.Mission == 2 and "t2") or ((m.Mission == 3 or m.Mission == 4) and "t3") or (m.Mission == 5 and "t5wait") or "m1", 0
                             nextAt = os.clock() + ((m.Mission == 5) and m.Training5.TeleportWait or m.StartDelay)
                             MentorInfo.phase = (m.Mission == 5) and ("t5 waiting for server teleport" .. (reloadNote and (" (NO RELOAD: " .. reloadNote .. ")") or "")) or string.format("starting in ~%ds", m.StartDelay)
