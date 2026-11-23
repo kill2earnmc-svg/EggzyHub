@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.103-unstick",
+    BuildNote = "v1.7.104-unstick2",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -1471,7 +1471,20 @@ do
                     trackedValue, since = disable, os.clock()
                 elseif os.clock() - since >= u.DisableSeconds then
                     pcall(function() disable.Value = false end)
-                    print(string.format("[EggzyUnstick] combat.disable was stuck true for %.0fs: set back to false", os.clock() - since))
+                    -- the other two values that differed in your A/B diff, restored to their "works" values (weapon.on = true, functions.key = "")
+                    local weaponOn = char:FindFirstChild("weapon") and char.weapon:FindFirstChild("on")
+                    if weaponOn and weaponOn:IsA("BoolValue") and weaponOn.Value == false then
+                        pcall(function() weaponOn.Value = true end)
+                    end
+                    local fnKey = combat:FindFirstChild("functions") and combat.functions:FindFirstChild("key")
+                    if fnKey and fnKey:IsA("StringValue") and fnKey.Value == "qend" then
+                        pcall(function() fnKey.Value = "" end)
+                    end
+                    print(string.format("[EggzyUnstick] combat.disable was stuck true for %.0fs: set back to false (also weapon.on=true, functions.key cleared)", os.clock() - since))
+                    task.delay(0.5, function()
+                        print(string.format("[EggzyUnstick] 0.5s later: disable=%s weapon.on=%s key=%s",
+                            tostring(disable.Value), tostring(weaponOn and weaponOn.Value), tostring(fnKey and fnKey.Value)))
+                    end)
                     trackedValue, since = nil, nil
                 end
             else
