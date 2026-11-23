@@ -84,7 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.113-ink",
+    BuildNote = "v1.7.114-version",
+    -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
+    -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
+    Version = { Tweaks = 114 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3481,6 +3484,8 @@ local homePage = createPage("Home")
 
 do
     local card, body = createCard(homePage, "Eggzy Hub", 1)
+    local versionRight = createInfoRow(body, "Version", string.format("%d.%d", Config.Version.Tweaks // 10, Config.Version.Tweaks % 10), 0)
+    versionRight.TextColor3 = Theme.Accent
     local statusRight = createInfoRow(body, "Status", "Active", 1)
     statusRight.TextColor3 = Theme.Success
 
