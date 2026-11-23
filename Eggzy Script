@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.106-nostick",
+    BuildNote = "v1.7.107-lockreset",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -1451,51 +1451,6 @@ task.spawn(function()
     end
 end)
 
--- ===================== COMBAT UNSTICK =====================
--- From your A/B diff: when it breaks, <character>.combat.disable is true (it was false), together with combat.functions.key = "qend",
--- weapon.on = false and walkSpeed 0. That is the game's own "can't act" lock; a move that never reached its end step leaves it on.
--- If it stays true for DisableSeconds (UNCALIBRATED: the real length of the longest legitimate move is not known) while the hub is
--- automating, set it back to false. Only that one value is touched.
-do
-    Config.Unstick = { Enabled = true, DisableSeconds = 8, Poll = 0.5 }
-    task.spawn(function()
-        local trackedValue, since = nil, nil
-        while Alive do
-            local u = Config.Unstick
-            local hubBusy = State.Grind or State.AutoQuest or State.Mentor
-            local char = LocalPlayer.Character
-            local combat = char and char:FindFirstChild("combat")
-            local disable = combat and combat:FindFirstChild("disable")
-            if u.Enabled and hubBusy and disable and disable:IsA("BoolValue") and disable.Value == true then
-                if trackedValue ~= disable then
-                    trackedValue, since = disable, os.clock()
-                elseif os.clock() - since >= u.DisableSeconds then
-                    pcall(function() disable.Value = false end)
-                    -- the other two values that differed in your A/B diff, restored to their "works" values (weapon.on = true, functions.key = "")
-                    local weaponOn = char:FindFirstChild("weapon") and char.weapon:FindFirstChild("on")
-                    if weaponOn and weaponOn:IsA("BoolValue") and weaponOn.Value == false then
-                        pcall(function() weaponOn.Value = true end)
-                    end
-                    local fnKey = combat:FindFirstChild("functions") and combat.functions:FindFirstChild("key")
-                    if fnKey and fnKey:IsA("StringValue") and fnKey.Value == "qend" then
-                        pcall(function() fnKey.Value = "" end)
-                    end
-                    print(string.format("[EggzyUnstick] combat.disable was stuck true for %.0fs: set back to false (also weapon.on=true, functions.key cleared)", os.clock() - since))
-                    task.delay(0.5, function()
-                        print(string.format("[EggzyUnstick] 0.5s later: disable=%s weapon.on=%s key=%s",
-                            tostring(disable.Value), tostring(weaponOn and weaponOn.Value), tostring(fnKey and fnKey.Value)))
-                    end)
-                    trackedValue, since = nil, nil
-                end
-            else
-                trackedValue, since = nil, nil
-            end
-
-            task.wait(u.Poll)
-        end
-    end)
-end
-
 -- ===================== INPUT PANIC =====================
 local function panic()
     forceReleaseInputs()
@@ -1824,6 +1779,73 @@ task.spawn(function()
         end
     end
 end)
+
+-- ===================== LOCK RECOVERY (Money Grind) =====================
+-- The lock cannot be cleared from the client (clearing combat.disable / weapon.on / the key, and turning fly and noclip off, did not free you),
+-- and your resets by hand fix it. Signature seen at every lock: <character>.combat.disable stays true. When it has stayed true for
+-- LockSeconds (UNCALIBRATED: the longest legitimate move that holds it is not known) during Money Grind, reset the character and
+-- return above the boss the same way the grind's own scheduled reset does.
+do
+    Config.LockRecovery = { Enabled = true, LockSeconds = 8, Poll = 0.5 }
+    task.spawn(function()
+        local trackedValue, since = nil, nil
+        while Alive do
+            local cfg = Config.LockRecovery
+            local char = LocalPlayer.Character
+            local combat = char and char:FindFirstChild("combat")
+            local disable = combat and combat:FindFirstChild("disable")
+            if cfg.Enabled and State.Grind and not State.Returning and disable and disable:IsA("BoolValue") and disable.Value == true then
+                if trackedValue ~= disable then
+                    trackedValue, since = disable, os.clock()
+                elseif os.clock() - since >= cfg.LockSeconds then
+                    print(string.format("[EggzyLock] combat.disable true for %.0fs: resetting and returning to the boss", os.clock() - since))
+                    trackedValue, since = nil, nil
+                    State.Returning = true
+                    pcall(function()
+                        local boss = State.BossAlive
+                        if not boss then
+                            for _, name in ipairs(Config.Bosses) do
+                                if Config.Quest.Selected[name] then boss = name break end
+                            end
+                        end
+                        local hum = char:FindFirstChildOfClass("Humanoid")
+                        pcall(function()
+                            if hum then hum.Health = 0 end
+                            char:BreakJoints()
+                        end)
+                        local newChar = waitForNewCharacter(char, Config.Teleport.RespawnTimeout)
+                        if not newChar then
+                            print("[EggzyLock] no new character within the respawn timeout")
+                            return
+                        end
+                        task.wait(0.8)
+                        if not State.Grind then return end
+                        table.clear(visited)
+                        State.Fly = true
+                        startFly()
+                        local newRoot = getRoot()
+                        local cam = Workspace.CurrentCamera
+                        if cam and newRoot then
+                            local pos = cam.CFrame.Position
+                            cam.CFrame = CFrame.lookAt(pos, newRoot.Position + Vector3.new(0, 90, 0))
+                        end
+                        forceReleaseInputs()
+                        if boss then
+                            local okBack = returnToBoss(boss)
+                            print("[EggzyLock] back above " .. tostring(boss) .. ": " .. tostring(okBack))
+                        else
+                            print("[EggzyLock] no boss known to return to")
+                        end
+                    end)
+                    State.Returning = false
+                end
+            else
+                trackedValue, since = nil, nil
+            end
+            task.wait(cfg.Poll)
+        end
+    end)
+end
 
 -- ===================== INSTANT KILL =====================
 task.spawn(function()
