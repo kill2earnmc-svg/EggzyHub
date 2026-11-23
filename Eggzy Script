@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.124-dungeontab",
+    BuildNote = "v1.7.127-dungeonbosses",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 124 },
+    Version = { Tweaks = 127 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -4139,10 +4139,33 @@ do
     Config.Dungeons = {
         List = { "Training Grounds", "Des Exams", "Samurai Bridge", "Sen Exams", "Narumaki Bridge", "Ember Hideout",
                  "Sovereign Summit", "Dawn Hideout", "Shindai Valley", "Korashi Manor", "Mount Maki", "Tyn Stone" },
-        Bosses = {},          -- [dungeon name] = { "boss name", ... }   UNSET until you give the names
+        -- Boss of each dungeon, from your list. Matching ignores case and punctuation (npctype / bossdrop), so the Tyn Stone boss is listed twice:
+        -- with your "(Gen 1)" suffix and without it, because the in-game npctype may not carry the suffix (unverified).
+        Bosses = {
+            ["Training Grounds"] = { "Dio Senko" },
+            ["Des Exams"]        = { "Arahaki Jokei" },
+            ["Samurai Bridge"]   = { "Tengoku" },
+            ["Sen Exams"]        = { "Rengoku" },
+            ["Narumaki Bridge"]  = { "Sengoku" },
+            ["Ember Hideout"]    = { "Bankai Akuma" },
+            ["Sovereign Summit"] = { "Rykan Shizen" },
+            ["Dawn Hideout"]     = { "Raion Rengoku" },
+            ["Shindai Valley"]   = { "Shindai Akuma" },
+            ["Korashi Manor"]    = { "Eastwood Korashi" },
+            ["Mount Maki"]       = { "Jayramaki Azure" },
+            ["Tyn Stone"]        = { "Tyn Tailed Spirit (Gen 1)", "Tyn Tailed Spirit" },
+        },
+        -- Enter call, captured with WrenchSpy: LocalPlayer.pressplay:FireServer("dungeon2") while entering one dungeon by hand.
+        -- You said the list is in numbering order, so dungeon N = "dungeonN" (dungeon2 = Des Exams). Only "dungeon2" was seen in a capture; the other
+        -- eleven codes follow from your statement and are unverified.
+        RemoteName = "pressplay",
+        EnterArg = {},
         AuraRange = 300,      -- studs, ASSUMED kill-aura reach (the hub's Instant Kill uses 120)
         Interval = 0.25,
     }
+    for i, name in ipairs(Config.Dungeons.List) do
+        Config.Dungeons.EnterArg[name] = "dungeon" .. i
+    end
     State.AutoDungeon = false
     State.Dungeon = Config.Dungeons.List[1]
     local DG = { status = "off", bossSeen = false, bossDone = false, warned = {} }
@@ -4295,7 +4318,37 @@ do
     end
     renderRows()
 
-    createToggle(body, "Auto Dungeon (kill aura + boss check)", 3, function() return State.AutoDungeon end, function(v)
+    local enterBtn = Instance.new("TextButton")
+    enterBtn.Name = "EnterDungeon"
+    enterBtn.Size = UDim2.new(1, 0, 0, 32)
+    enterBtn.BackgroundColor3 = Theme.Off
+    enterBtn.BorderSizePixel = 0
+    enterBtn.Text = "Enter selected dungeon"
+    enterBtn.TextColor3 = Theme.Text
+    enterBtn.Font = Enum.Font.GothamMedium
+    enterBtn.TextSize = 12
+    enterBtn.AutoButtonColor = true
+    enterBtn.LayoutOrder = 3
+    enterBtn.Parent = body
+    Instance.new("UICorner", enterBtn).CornerRadius = UDim.new(0, 7)
+    function DG.enter()
+        local arg = Config.Dungeons.EnterArg[State.Dungeon]
+        if type(arg) ~= "string" or arg == "" then
+            print("[EggzyDungeon] no enter code set for " .. tostring(State.Dungeon) .. " (Config.Dungeons.EnterArg)")
+            return false
+        end
+        local remote = LocalPlayer:FindFirstChild(Config.Dungeons.RemoteName)
+        if not remote or not remote:IsA("RemoteEvent") then
+            print("[EggzyDungeon] LocalPlayer." .. Config.Dungeons.RemoteName .. " not found")
+            return false
+        end
+        local okFire, err = pcall(function() remote:FireServer(arg) end)
+        if not okFire then print("[EggzyDungeon] enter failed: " .. tostring(err)) end
+        return okFire
+    end
+    enterBtn.MouseButton1Click:Connect(DG.enter)
+
+    createToggle(body, "Auto Dungeon (kill aura + boss check)", 4, function() return State.AutoDungeon end, function(v)
         State.AutoDungeon = v
         DG.bossSeen, DG.bossDone = false, false
     end)
@@ -4308,7 +4361,7 @@ do
     statusLabel.Font = Enum.Font.Gotham
     statusLabel.TextSize = 11
     statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    statusLabel.LayoutOrder = 4
+    statusLabel.LayoutOrder = 5
     statusLabel.Parent = body
     task.spawn(function()
         while Alive do
@@ -4326,7 +4379,7 @@ do
     dumpBtn.Font = Enum.Font.GothamMedium
     dumpBtn.TextSize = 12
     dumpBtn.AutoButtonColor = true
-    dumpBtn.LayoutOrder = 5
+    dumpBtn.LayoutOrder = 6
     dumpBtn.Parent = body
     Instance.new("UICorner", dumpBtn).CornerRadius = UDim.new(0, 7)
     dumpBtn.MouseButton1Click:Connect(function()
