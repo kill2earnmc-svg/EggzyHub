@@ -1,433 +1,3858 @@
--- WrenchSpy.lua (client-side Luau remote spy)
--- Logs every RemoteEvent:FireServer / UnreliableRemoteEvent:FireServer / RemoteFunction:InvokeServer
--- your own client sends, with the remote's path, its arguments, and a ready-to-paste call line.
--- Use: run it, then do the action once in game (talk to the rank-up NPC), then press Copy.
--- Needs an executor with hookmetamethod, getnamecallmethod, newcclosure, checkcaller.
--- Hotkeys: F8 = show/hide the window. Output file: WrenchSpy_out.txt (written by the Save button).
-
+-- ============================================================================
+-- EggzyHub.lua (client-side Luau) — Full Production Build (Optimized & Cleaned)
+-- Updated: Strict boundary-detection with non-overlapping Y ranges for all regions.
+-- Added: Auto Mentor (detect mentor, talk to it, then M1 once per second).
+-- ============================================================================
 local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local okVim, VIM = pcall(game.GetService, game, "VirtualInputManager")
 
-local Config = {
-    MaxLines = 300,          -- log lines kept on screen
-    MaxTableEntries = 40,    -- table entries printed per table
-    MaxDepth = 4,            -- table nesting printed
-    MaxStringLength = 200,   -- characters of a string argument printed
-    ThrottleCalls = 8,       -- same remote more than this many times ...
-    ThrottleWindow = 1,      -- ... inside this many seconds = auto-muted (noise filter)
-    ShowOwnCalls = false,    -- true also logs calls made by executor scripts (checkcaller)
-    OutFile = "WrenchSpy_out.txt",
+-- Everything the hub prints is also kept in EggzyHub_log.txt (last 400 lines, survives server teleports),
+-- so one file shows what happened before and after a teleport.
+local rawPrint = print
+local LOG_FILE = "EggzyHub_log.txt"
+local logBuf = {}
+if isfile and readfile and isfile(LOG_FILE) then
+    local okR, old = pcall(readfile, LOG_FILE)
+    if okR and type(old) == "string" then
+        for line in old:gmatch("[^\n]+") do logBuf[#logBuf + 1] = line end
+        while #logBuf > 300 do table.remove(logBuf, 1) end
+    end
+end
+local function print(...)
+    rawPrint(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    logBuf[#logBuf + 1] = os.date("%X") .. " " .. table.concat(parts, " ")
+    while #logBuf > 400 do table.remove(logBuf, 1) end
+    if writefile then pcall(writefile, LOG_FILE, table.concat(logBuf, "\n")) end
+end
+print("---- EggzyHub started | place " .. tostring(game.PlaceId) .. " | job " .. tostring(game.JobId))
+
+local questFolder
+
+-- ===================== CONFIG =====================
+local BossNames = {
+    "Ailee Minakami", "Alphirama Dangan", "Apollo Sabaku", "Arahaki Jokei", "Ashen Storm",
+    "Azim Senko", "Bankai Akuma", "Borumaki", "Borumaki Gaiden", "Bruce Kenichi",
+    "Deuce Wanziame", "Deva", "Dio Senko", "Eastwood Korashi", "Forged",
+    "Forged Akuma", "Garin Atomic", "Ghost Azarashi", "Gingerbread Chad", "Giovanni Shizen",
+    "Headless Korashi", "Jayramaki", "Jinshiki", "Jiso Seishin", "Kabu Cobra",
+    "Kagoku", "Kamaki", "Kamaki Akuma", "Light Jokei", "Menza Azarashi",
+    "Minakaze Senko", "Narumaki", "Odin Saberu", "Pika Senko", "PTS Deva",
+    "Pts Raion", "Raion Akuma", "Raion Rengoku", "Renshiki", "Riser Akuma",
+    "Rykan Shizen", "Ryuji Kenichi", "Sarachia Akuma", "Satori Akuma", "Satoru Okami",
+    "Sengoku", "Shiba Glacier", "Shindai Akuma", "Shindai Rengoku", "Shiver Akuma",
+    "Tengoku", "Xeno Dokei",
 }
 
-if getgenv then
-    local old = getgenv().WrenchSpyInstance
-    if old and old.Stop then pcall(old.Stop) end
-end
-
-local missing = {}
-for _, name in ipairs({ "hookmetamethod", "getnamecallmethod", "newcclosure", "checkcaller" }) do
-    if not getfenv()[name] and not (getgenv and getgenv()[name]) then
-        missing[#missing + 1] = name
+local SCROLL_PREFIX = "bossdrop"
+local function isScrollModel(m)
+    if not m:IsA("Model") then return false end
+    if m:FindFirstChild("missiongiver") or m.Name:lower():find("mission") then return false end
+    
+    local nameLower = m.Name:lower()
+    if nameLower:find("scroll") or nameLower:find("batarang") or nameLower:find("gscroll") then
+        return true
     end
-end
-if #missing > 0 then
-    warn("[WrenchSpy] this executor lacks: " .. table.concat(missing, ", ") .. " -- cannot hook remotes")
-    return
-end
-
-local hookmetamethod_ = hookmetamethod or getgenv().hookmetamethod
-local getnamecallmethod_ = getnamecallmethod or getgenv().getnamecallmethod
-local newcclosure_ = newcclosure or getgenv().newcclosure
-local checkcaller_ = checkcaller or getgenv().checkcaller
-
--- ---------------------------------------------------------------- pure formatting helpers
-local function isIdentifier(s)
-    return type(s) == "string" and s:match("^[%a_][%w_]*$") ~= nil
-end
-
-local function quote(s)
-    s = tostring(s)
-    local cut = false
-    if #s > Config.MaxStringLength then
-        s = s:sub(1, Config.MaxStringLength)
-        cut = true
+    
+    if m.Parent == Workspace then
+        if string.sub(nameLower, 1, #SCROLL_PREFIX) == SCROLL_PREFIX or nameLower == "globaltime" then
+            return true
+        end
     end
-    s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("[%c]", "?")
-    return '"' .. s .. (cut and '..."' or '"')
+    
+    local gt = Workspace:FindFirstChild("GLOBALTIME")
+    if gt and m.Parent == gt then
+        return true
+    end
+
+    for _, d in ipairs(m:GetDescendants()) do
+        local dName = d.Name:lower()
+        if dName:find("scroll") or dName == "gscroll" or dName == "scroll2" then
+            return true
+        end
+    end
+
+    return false
 end
 
--- game.Workspace.Folder["Odd Name"].Part  (first segment is the service)
-local function instancePath(inst)
-    local okChain, chain = pcall(function()
+local Config = {
+    BuildNote = "v1.7.96-rankup",
+    Debug = true,
+    MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
+    PanicKey = Enum.KeyCode.End,
+    ToggleKey = Enum.KeyCode.RightShift,
+    BackupToggleKey = Enum.KeyCode.Insert,
+    StallWarnSeconds = 1.0,
+    ESPSettings = {
+        MaxDistance  = 1500,
+        ScanInterval = 0.5,
+        MaxHighlights = 10,
+    },
+    BossScan = {
+        ScanInterval  = 0.5,
+        TrackInterval = 1.0,
+        DeadConfirmSeconds = 1.5,
+        SpamQ = true,
+        SpamRange = 150,
+        SpamKey = Enum.KeyCode.Q,
+        SpamPeriod = 5,
+        SpamHold = 0.05,
+        SpamFirstDelay = 1.0,
+    },
+    Bosses = BossNames,
+    ESP = {
+        ScrollESP = { 
+            Match = isScrollModel,
+            Adornee = function(m) return m:FindFirstChild("scroll2") or m:FindFirstChildWhichIsA("BasePart", true) end,
+            Color = Color3.fromRGB(80, 220, 255) 
+        },
+        Players = { 
+            Match = function(m) return Players:GetPlayerFromCharacter(m) ~= nil end,
+            Color = Color3.fromRGB(100, 255, 120) 
+        },
+        BossNPCESP = {
+            Match = function(m)
+                if not m:IsA("Model") then return false end
+                if Players:GetPlayerFromCharacter(m) ~= nil then return false end
+                if isScrollModel(m) then return false end
+                if not m:FindFirstChildOfClass("Humanoid") then return false end
+                
+                local nameLower = m.Name:lower()
+                if nameLower:find("training") or nameLower:find("log") or nameLower:find("dummy") then
+                    return false
+                end
+
+                local parentName = m.Parent and m.Parent.Name:lower() or ""
+                if parentName == "npc" or m:FindFirstChild("npctype") or m:FindFirstChild("bossdrop") then
+                    return true
+                end
+                
+                for _, bName in ipairs(BossNames) do
+                    if nameLower:find(bName:lower(), 1, true) then
+                        return true
+                    end
+                end
+                return false
+            end,
+            Adornee = function(m) return m:FindFirstChild("Head") or m:FindFirstChild("HumanoidRootPart") or m:FindFirstChildWhichIsA("BasePart", true) end,
+            Color = Color3.fromRGB(255, 80, 80)
+        }
+    },
+    Quest = {
+        Root      = { "bossdropmission", "missions" },
+        GiverPath = { "missiongiver", "CLIENTTALK" },
+        Selected  = {},
+        Interval  = 2.0,
+        Stagger   = 0.1,
+    },
+    Kill = {
+        Range        = 120,
+        Interval     = 0.5,
+        UseHitRemote = true,
+        RemoteName   = "startevent",
+        MaxHits      = 3,
+    },
+    Mentor = {
+        -- Source: your WrenchMentorSpy capture, FireServer(LocalPlayer) on
+        -- Workspace.sensei.missions.Bruce Kenichi.missiongiver.CLIENTTALK
+        RootPath       = { "sensei", "missions" },
+        GiverPath      = { "missiongiver", "CLIENTTALK" },
+        Default        = "Bruce Kenichi", -- only used when detection finds nothing; the one mentor captured so far
+        -- ASSUMPTION (unverified): the game keeps your mentor as a string/object value or attribute
+        -- under LocalPlayer. Key names below only rank candidates; a match always requires the
+        -- value to equal a real folder name under RootPath.
+        DetectKeywords = { "mentor", "sensei" },
+        Interval       = 5.0,             -- uncalibrated, seconds between talk attempts
+        M1Count        = 30,              -- from you: first mission is pressing M1 30 times
+        StartDelay     = 12,              -- from you: wait 12 s after the quest is taken before the first M1
+        M1Period       = 1.0,             -- from you: one M1 press per second
+        M1Hold         = 0.05,            -- uncalibrated click hold time
+        ProgressFile   = "EggzyMentorProgress.txt", -- remembers which training you are on across leave/rejoin (the game's own quest state is not known yet)
+        StartMission   = 1,               -- the chain starts here when there is no progress file (1 = M1 x30); each training hands over to the next, 5 is the fight, 6 = all done
+        Mission        = 1,               -- which training the loop runs: 1 = M1 x30, 2 = teleport routine (Training2), 3 = kunai aim (Training3), 4 = look only (Training4), 5 = mentor fight (Training5, fight server only)
+        Training3 = {                    -- quest 3: aim at the target and throw kunai with M1, 20 hits
+            TargetName    = "kunaiaim", -- from you: the target is the part called kunaiaim (path of the live one: Workspace.Terrain.<PlayerName>.kunaiaim, also searched by name)
+            Repeats       = 20,         -- from you: 20 hits
+            FindTimeout   = 10,         -- seconds to wait for the target to exist (uncalibrated)
+            AimSettle     = 0.25,       -- seconds after turning the camera before the first throw (uncalibrated)
+            M1Hold        = 0.05,
+            ThrowCooldown = 1.0,        -- from you: at least 1 second between throws (also across rounds)
+            HitWait       = 2.0,        -- seconds to wait for a throw to hit before throwing again (uncalibrated kunai flight time)
+            MaxThrows     = 5,          -- throws per target before the round counts as failed
+            MoveThreshold = 3,          -- studs the target may move/respawn before it counts as hit (uncalibrated)
+            RoundGap      = 0.3,
+            MaxFails      = 3,          -- consecutive failed rounds before talking to the mentor again
+            Poll          = 0.1,
+        },
+        QuestSnapshotFile = "EggzyQuestSnapshot.txt", -- written after every talk and in the fight server; shows what the game exposes about the current quest
+        Training5 = {                    -- quest 5: mentor fight in the other server
+            QPeriod      = 5,           -- from you: press Q every 5 seconds while the boss is alive
+            Offset       = 30,          -- from you: 30 studs ABOVE the boss (positive = above, negative = under; it was 90 then 60 under)
+            BossFolder   = "npc",       -- ASSUMED: same folder the grind uses; unverified in the mentor-fight server (falls back to Workspace children)
+            TeleportWait = 60,          -- seconds to wait for the server teleport after talking before talking again (uncalibrated)
+            ResumeFile   = "EggzyResume.txt", -- flag file written when the fight-server teleport is expected; survives the teleport
+            ResumeWindow = 300,         -- seconds the flag stays valid after it was written (uncalibrated: teleport + load time)
+            ReloadFile   = "EggzyHub.lua", -- executor workspace file the hub is reloaded from after the teleport (or set getgenv().EggzyHubReloadUrl)
+            BossTimeout  = 180,         -- seconds to keep pressing Q waiting for the boss before giving up (uncalibrated)
+            AliveConfirm = 1.0,         -- seconds the boss must read alive before its hp is set to 0 (uncalibrated)
+        },
+        Training4 = {                    -- quest 4: same targets (Training3.TargetName), only look at them, no M1
+            Repeats     = 20,           -- ASSUMED same as quest 3, not told yet
+            LookTimeout = 15,           -- seconds to keep looking before a target counts as failed (uncalibrated)
+            RoundGap    = 0.3,
+            MaxFails    = 3,
+        },
+        Training2 = {
+            -- Measured from your manual tree jump (TrainingWatch log): pos 19066.7109, 929.7803, -12211.6123, heading 90.8,
+            -- where the game accepted it. Your original spot 19063.811, -12214.149 is about 3.9 studs away from it.
+            TeleportTo    = Vector3.new(19066.711, 932.780, -12211.612), -- working spot X/Z, your +3 height
+            WaitAt        = Vector3.new(19066.711, 929.780, -12211.612), -- working spot, your Y 929.780
+            ReturnTo      = Vector3.new(19063.811, 932.780, -12214.149), -- from you: the "tp back" destination
+            Facing        = 90.8,     -- measured at the working spot (you asked for 94); same scale as the Facing row: 0 = -Z, 90 = +X
+            JumpHold      = 1.0,      -- from you: hold space/jump 1 second (was 0.5)
+            Repeats       = 20,       -- from you: tp back and repeat 20 times
+            RepGap        = 0.5,      -- pause between repetitions (uncalibrated)
+            MaxFails      = 3,        -- consecutive reps that never reached WaitAt before giving up and talking again
+            SettleAfterLand = 0.3,    -- wait after landing before Space (uncalibrated; manual jumps are never instant)
+            AfterJumpWait = 4.0,      -- from you: let the jump run 4 seconds after Space is released, then tp back
+            ArriveRadius  = 2,        -- uncalibrated: studs from WaitAt that counts as "there"
+            ArriveTimeout = 30,       -- uncalibrated: give up and teleport back after this many seconds
+            Poll          = 0.1,
+        },
+    },
+    Scroll = {
+        Clicks       = 3,           -- from you: click the scroll 3 times
+        ClickGap     = 0.25,        -- seconds between clicks (uncalibrated)
+        ClickHold    = 0.05,        -- how long each click is held (uncalibrated)
+        ClickHeight  = 6,           -- studs above the scroll you hover while looking straight down (uncalibrated)
+        Settle       = 0.3,         -- seconds to wait at the scroll before the first click (uncalibrated)
+        Scan         = 1,           -- seconds between scroll scans
+        PartName     = "sh",
+        RemoteName   = "invoke",
+        MinY         = -1000,
+        MaxY         = 2000,
+        TweenSpeed   = 500,
+        ScanInterval = 3,
+        MaxAttempts  = 3,
+        AttemptDelay = 1,
+        OwnsScroll   = function(scrollModel)
+            local scrollName = scrollModel.Name
+            if Players.LocalPlayer.Backpack:FindFirstChild(scrollName) or (Players.LocalPlayer.Character and Players.LocalPlayer.Character:FindFirstChild(scrollName)) then
+                return true
+            end
+            return false
+        end,
+    },
+    Teleport = {
+        DefaultHeight  = -90,
+        WaitSeconds    = 15,
+        Poll           = 0.5,
+        RespawnTimeout = 30,
+        ReturnSeconds  = 45,
+        VerifyRadius   = 25,
+        ReturnPoll     = 0.2,
+        VerifyWait     = 0.2,
+    },
+    Grind = {
+        DefaultHeight   = -90,
+        WaitSeconds     = 8,
+        Poll            = 0.5,
+        Key             = Enum.KeyCode.Q,
+        KeyHold         = 0.05,
+        KeyDelay        = 0.3,
+        KillSeconds     = 3,
+        KillStep        = 0.5,
+        ResetInterval   = 600,
+        StallSeconds    = 45,
+    },
+    FlySpeed   = 70,
+    WalkSpeed  = 30,
+    JumpPower  = 50,
+    JumpHeight = 7.2,
+}
+
+local CurrentVillage = "Unknown"
+
+local LocalPlayer = Players.LocalPlayer
+local function getRoot()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart"), c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function getBossHeight(bossName)
+    if bossName then
+        local bLower = bossName:lower()
+        if bLower == "satoru okami" then
+            return -60
+        elseif bLower == "bankai akuma" or bLower == "arahaki jokei" then
+            return -60
+        end
+    end
+    return Config.Grind.DefaultHeight
+end
+
+-- ===================== THEME =====================
+local Theme = {
+    Background   = Color3.fromRGB(10, 10, 12),
+    Sidebar      = Color3.fromRGB(14, 14, 17),
+    Surface      = Color3.fromRGB(18, 18, 22),
+    SurfaceHover = Color3.fromRGB(28, 26, 18),
+    Card         = Color3.fromRGB(16, 16, 20),
+    Accent       = Color3.fromRGB(255, 196, 0),
+    AccentDim    = Color3.fromRGB(180, 130, 0),
+    Text         = Color3.fromRGB(235, 235, 240),
+    TextDim      = Color3.fromRGB(120, 120, 135),
+    TextMuted    = Color3.fromRGB(80, 80, 95),
+    Off          = Color3.fromRGB(28, 28, 34),
+    On           = Color3.fromRGB(200, 150, 0),
+    Success      = Color3.fromRGB(60, 200, 120),
+    Border       = Color3.fromRGB(42, 40, 30),
+    BorderSoft   = Color3.fromRGB(32, 30, 24),
+    Selected     = Color3.fromRGB(32, 28, 14),
+    Picked       = Color3.fromRGB(45, 38, 18),
+}
+
+local function guiParent()
+    if typeof(gethui) == "function" then return gethui() end
+    return game:GetService("CoreGui")
+end
+
+local connections = {}
+local function track(c) connections[#connections + 1] = c; return c end
+local Alive = true
+
+local State = { 
+    Fly = false, Noclip = false, AutoQuest = false, Kill = false,
+    Scrolls = false, TpScroll = false, Grind = false, Fps = false,
+    Speed = false, Jump = false, InfiniteJump = false, Mentor = false,
+    Returning = false, AutoRank = false,
+    ScrollTrip = false, -- true while the scroll stealer is away from the grind position
+    BossAlive = nil,
+    ESP = { ScrollESP = false, Players = false, BossNPCESP = false } 
+}
+
+-- ===================== MAP & VILLAGE DETECTOR =====================
+-- Landmark-only. No Y bands.
+-- Priority: nearby missiongiver (strong) > nearby mapped boss (medium).
+-- Tight radius so distant maps cannot leak in. Longer keywords matched first.
+-- Holds last known name when nothing is in range.
+
+local VillageKeywords = {
+    -- longest only — bare "training"/"shindai"/"ryuji" match dummies & boss names in other maps
+    { key = "forest of embers", name = "Forest of Embers" },
+    { key = "forestofembers",   name = "Forest of Embers" },
+    { key = "great narumaki",   name = "Great Narumaki Bridge" },
+    { key = "narumaki bridge",  name = "Great Narumaki Bridge" },
+    { key = "mount maki",       name = "Mount Maki" },
+    { key = "mountmaki",        name = "Mount Maki" },
+    { key = "shindai valley",   name = "Shindai Valley" },
+    { key = "shindaivalley",    name = "Shindai Valley" },
+    { key = "training fields",  name = "Training Fields" },
+    { key = "trainingfields",   name = "Training Fields" },
+    { key = "dawn hideout",     name = "Dawn Hideout" },
+    { key = "dawnhideout",      name = "Dawn Hideout" },
+    { key = "shikai forest",    name = "Shikai Forest" },
+    { key = "shikaiforest",     name = "Shikai Forest" },
+    { key = "ryuji cave",       name = "Ryuji Cave" },
+    { key = "ryujicave",        name = "Ryuji Cave" },
+    { key = "tempest village",  name = "Tempest Village" },
+    { key = "tempest",          name = "Tempest Village" },
+    { key = "vinland",          name = "Vinland" },
+    { key = "espada",           name = "Espada" },
+    { key = "jejun",            name = "Jejunes Village" },
+    { key = "obelisk",          name = "Obelisk Village" },
+    { key = "nimbus",           name = "Nimbus Village" },
+    { key = "dunes",            name = "Dunes Village" },
+    { key = "blaze",            name = "Ember or Blaze" },
+    { key = "haze",             name = "Haze Village" },
+    { key = "ember village",    name = "Ember or Blaze" },
+    { key = "ember",            name = "Ember or Blaze" },
+}
+
+-- Boss mission scroll → village (spawn location guides)
+-- BUGFIX: Satoru Okami is Obelisk, was wrongly set to Nimbus
+local BossVillage = {
+    -- Ember + Blaze share the same boss scrolls
+    ["bankaiakuma"] = "Ember or Blaze",
+    ["diosenko"] = "Ember or Blaze",
+    ["raionakuma"] = "Ember or Blaze",
+    ["ptsraion"] = "Ember or Blaze",
+    ["satoriakuma"] = "Ember or Blaze",
+    ["forged"] = "Ember or Blaze",
+    ["forgedakuma"] = "Ember or Blaze",
+    ["kamaki"] = "Ember or Blaze",
+    ["kamakiakuma"] = "Ember or Blaze",
+    ["sarachiaakuma"] = "Ember or Blaze",
+    -- Obelisk
+    ["jisoseishin"] = "Obelisk Village",
+    ["satoruokami"] = "Obelisk Village",
+    ["lightjokei"] = "Obelisk Village",
+    ["kabucobra"] = "Obelisk Village",
+    ["arahakijokei"] = "Obelisk Village",
+    ["jinshiki"] = "Obelisk Village",
+    ["tengoku"] = "Obelisk Village",
+    -- Nimbus
+    ["odinsaberu"] = "Nimbus Village",
+    ["xenodokei"] = "Nimbus Village",
+    ["ashenstorm"] = "Nimbus Village",
+    ["giovannishizen"] = "Nimbus Village",
+    -- Haze
+    ["riserakuma"] = "Haze Village",
+    ["shibaglacier"] = "Haze Village",
+    ["alphiramadangan"] = "Haze Village",
+    ["rykanshizen"] = "Haze Village",
+    ["deucewanziame"] = "Haze Village",
+    -- Dunes
+    ["garinatomic"] = "Dunes Village",
+    ["menzaazarashi"] = "Dunes Village",
+    ["apollosabaku"] = "Dunes Village",
+    ["pikasenko"] = "Dunes Village",
+    ["aileeminakami"] = "Dunes Village",
+    ["azimsenko"] = "Dunes Village",
+    -- Training Fields
+    ["brucekenichi"] = "Training Fields",
+    ["ryujikenichi"] = "Training Fields",
+    -- Dawn Hideout
+    ["shindaiakuma"] = "Dawn Hideout",
+    ["shiverakuma"] = "Dawn Hideout",
+    ["raionrengoku"] = "Dawn Hideout",
+    -- Tempest
+    ["ghostazarashi"] = "Tempest Village",
+    ["ptsdeva"] = "Tempest Village",
+    ["renshiki"] = "Tempest Village",
+    -- Great Narumaki Bridge
+    ["narumaki"] = "Great Narumaki Bridge",
+    ["minakazesenko"] = "Great Narumaki Bridge",
+    ["jayramaki"] = "Great Narumaki Bridge",
+    ["borumaki"] = "Great Narumaki Bridge",
+    ["borumakigaiden"] = "Great Narumaki Bridge",
+    -- Jejunes
+    ["headlesskorashi"] = "Jejunes Village",
+    ["eastwoodkorashi"] = "Jejunes Village",
+}
+
+local function normKey(s)
+    return (string.lower(tostring(s or "")):gsub("[^%w]", ""))
+end
+
+local function nameHitsVillage(raw)
+    if not raw or raw == "" then return nil end
+    local lower = string.lower(raw)
+    for _, entry in ipairs(VillageKeywords) do
+        if lower:find(entry.key, 1, true) then
+            return entry.name
+        end
+    end
+    return nil
+end
+
+local function partPosition(inst)
+    if not inst then return nil end
+    if inst:IsA("BasePart") then return inst.Position end
+    if inst:IsA("Model") then
+        local p = inst:FindFirstChild("HumanoidRootPart")
+            or inst:FindFirstChild("Head")
+            or inst:FindFirstChildWhichIsA("BasePart", true)
+        return p and p.Position
+    end
+    local p = inst:FindFirstChildWhichIsA("BasePart", true)
+    return p and p.Position
+end
+
+local function villageFromBossName(raw)
+    if not raw or raw == "" then return nil end
+    local key = normKey(raw)
+    local direct = BossVillage[key]
+    if direct then return direct end
+    for bossKey, village in pairs(BossVillage) do
+        if #bossKey >= 6 and (key:find(bossKey, 1, true) or bossKey:find(key, 1, true)) then
+            return village
+        end
+    end
+    -- do NOT fall back to nameHitsVillage here — mission names are boss names, not map names
+    return nil
+end
+
+local function detectVillageFromWorld(fromPos)
+    -- Collect hits, then majority-vote the closest cluster.
+    -- No Y logic. No default to Nimbus.
+    local hits = {} -- { name, dist }
+    local SCAN = 6000
+
+    local function push(name, pos)
+        if not name or not pos then return end
+        local d = (pos - fromPos).Magnitude
+        if d > SCAN then return end
+        hits[#hits + 1] = { name = name, dist = d }
+    end
+
+    local missionRoots = {
+        Workspace:FindFirstChild("bossdropmission"),
+        Workspace:FindFirstChild("HAPPYmission"),
+        Workspace:FindFirstChild("Koramamission"),
+        Workspace:FindFirstChild("missiongivers"),
+    }
+    for _, rootFolder in ipairs(missionRoots) do
+        if rootFolder then
+            local missions = rootFolder:FindFirstChild("missions") or rootFolder
+            for _, mission in ipairs(missions:GetChildren()) do
+                local hit = villageFromBossName(mission.Name)
+                if hit then
+                    local giver = mission:FindFirstChild("missiongiver")
+                        or mission:FindFirstChild("CLIENTTALK", true)
+                        or mission
+                    push(hit, partPosition(giver))
+                end
+            end
+            for _, child in ipairs(rootFolder:GetDescendants()) do
+                local n = child.Name:lower()
+                if n == "missiongiver" or n == "clienttalk" then
+                    local parent = child.Parent
+                    local hit = villageFromBossName(parent and parent.Name)
+                        or villageFromBossName(parent and parent.Parent and parent.Parent.Name)
+                    if hit then
+                        push(hit, partPosition(child))
+                    end
+                end
+            end
+        end
+    end
+
+    local npcFolder = Workspace:FindFirstChild("npc")
+    if npcFolder then
+        for _, m in ipairs(npcFolder:GetChildren()) do
+            if m:IsA("Model") then
+                local pos = partPosition(m)
+                if pos then
+                    local key = normKey(m.Name)
+                    local fromNt = m:FindFirstChild("npctype")
+                    if fromNt and fromNt:IsA("StringValue") and fromNt.Value ~= "" then
+                        key = normKey(fromNt.Value)
+                    end
+                    local bd = m:FindFirstChild("bossdrop")
+                    if bd and bd:IsA("StringValue") and bd.Value ~= "" then
+                        key = normKey(bd.Value):gsub("char$", "")
+                    end
+                    local village = BossVillage[key] or villageFromBossName(key)
+                    if village then
+                        push(village, pos)
+                    end
+                end
+            end
+        end
+    end
+
+    if #hits == 0 then
+        if Config.MapDebug then
+            print("[EggzyMap] no landmark hits")
+        end
+        return nil, math.huge
+    end
+
+    table.sort(hits, function(a, b) return a.dist < b.dist end)
+
+    if Config.MapDebug then
         local parts = {}
-        local cur = inst
-        local guard = 0
-        while cur and cur ~= game and guard < 60 do
-            parts[#parts + 1] = cur
-            cur = cur.Parent
-            guard += 1
+        for i = 1, math.min(5, #hits) do
+            parts[#parts + 1] = string.format("%s@%.0f", hits[i].name, hits[i].dist)
         end
-        if cur ~= game then return nil end
-        return parts
+        print("[EggzyMap] top:", table.concat(parts, " | "))
+    end
+
+    -- nearest single hit under 1200 always wins
+    if hits[1].dist <= 1200 then
+        return hits[1].name, hits[1].dist
+    end
+
+    -- otherwise majority among the 8 nearest
+    local topN = math.min(8, #hits)
+    local counts = {}
+    local bestVote, bestVoteName = 0, hits[1].name
+    local nearestFor = {}
+    for i = 1, topN do
+        local n = hits[i].name
+        counts[n] = (counts[n] or 0) + 1
+        if not nearestFor[n] then nearestFor[n] = hits[i].dist end
+        if counts[n] > bestVote or (counts[n] == bestVote and nearestFor[n] < (nearestFor[bestVoteName] or math.huge)) then
+            bestVote = counts[n]
+            bestVoteName = n
+        end
+    end
+
+    return bestVoteName, nearestFor[bestVoteName] or hits[1].dist
+end
+
+local _mapLockName = nil
+local _mapLockScore = math.huge
+local SWITCH_MARGIN = 800
+local HARD_LOCK = 1200
+
+track(RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+    if not _G._lastMapCheck or now - _G._lastMapCheck > 1.0 then
+        _G._lastMapCheck = now
+        local root = getRoot()
+        if not root then return end
+
+        local name, score = detectVillageFromWorld(root.Position)
+        if not name or not score or score == math.huge then
+            return
+        end
+
+        if not _mapLockName then
+            _mapLockName, _mapLockScore = name, score
+            CurrentVillage = name
+            return
+        end
+
+        if name == _mapLockName then
+            _mapLockScore = math.min(_mapLockScore, score)
+            CurrentVillage = name
+            return
+        end
+
+        if score <= HARD_LOCK or score + SWITCH_MARGIN < _mapLockScore then
+            _mapLockName, _mapLockScore = name, score
+            CurrentVillage = name
+        end
+    end
+end))
+
+-- ===================== INPUT HELPERS =====================
+local heldKeys = {}
+local pressing = false
+local mouseHeld = false
+
+local function sendKey(down, keyCode)
+    if okVim and VIM then
+        VIM:SendKeyEvent(down, keyCode, false, game)
+    elseif down then
+        VirtualUser:KeyDown(keyCode)
+    else
+        VirtualUser:KeyUp(keyCode)
+    end
+end
+
+-- M1 = left mouse button. Clicks at the viewport centre (not the cursor) so a click can never
+-- land on the hub's own buttons.
+local function sendMouse(down)
+    local cam = Workspace.CurrentCamera
+    if okVim and VIM then
+        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+        VIM:SendMouseButtonEvent(vp.X / 2, vp.Y / 2, 0, down, game, 0)
+    elseif down then
+        VirtualUser:Button1Down(Vector2.zero, cam and cam.CFrame or CFrame.new())
+    else
+        VirtualUser:Button1Up(Vector2.zero, cam and cam.CFrame or CFrame.new())
+    end
+end
+
+local function forceReleaseInputs()
+    for keyCode in pairs(heldKeys) do
+        heldKeys[keyCode] = nil
+        pcall(sendKey, false, keyCode)
+    end
+    if mouseHeld then
+        mouseHeld = false
+        pcall(sendMouse, false)
+    end
+end
+
+local function sendChat(message)
+    pcall(function()
+        local textChatService = game:GetService("TextChatService")
+        if textChatService.ChatInputBarConfiguration and textChatService.ChatInputBarConfiguration.TargetTextChannel then
+            textChatService.ChatInputBarConfiguration.TargetTextChannel:SendAsync(message)
+            return
+        end
     end)
-    if not okChain or not chain then
-        local okName, name = pcall(function() return inst:GetFullName() end)
-        return "nil --[[ not in the game tree: " .. (okName and name or tostring(inst)) .. " ]]"
+    pcall(function()
+        local defaultChatSystemChatEvents = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+        if defaultChatSystemChatEvents then
+            local sayMessageRequest = defaultChatSystemChatEvents:FindFirstChild("SayMessageRequest")
+            if sayMessageRequest then
+                sayMessageRequest:FireServer(message, "All")
+                return
+            end
+        end
+    end)
+end
+
+-- ===================== FLIGHT =====================
+local flyBV, flyBG
+local lastFlyHeal = 0
+local function stopFly()
+    if flyBV then flyBV:Destroy() flyBV = nil end
+    if flyBG then flyBG:Destroy() flyBG = nil end
+    local _, hum = getRoot()
+    if hum then hum.PlatformStand = false end
+    forceReleaseInputs()
+end
+
+local function ensureFlyMovers(root, hum)
+    if flyBV then flyBV:Destroy() flyBV = nil end
+    if flyBG then flyBG:Destroy() flyBG = nil end
+    if hum then hum.PlatformStand = true end
+    flyBV = Instance.new("BodyVelocity")
+    flyBV.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+    flyBV.Velocity = Vector3.zero
+    flyBV.Parent = root
+    flyBG = Instance.new("BodyGyro")
+    flyBG.MaxTorque = Vector3.new(1e6, 1e6, 1e6)
+    flyBG.P = 9e4
+    flyBG.Parent = root
+end
+
+local function startFly()
+    local root, hum = getRoot()
+    if not root then return end
+    stopFly()
+    ensureFlyMovers(root, hum)
+end
+
+track(RunService.RenderStepped:Connect(function()
+    if not State.Fly then return end
+    local root, hum = getRoot()
+    local cam = Workspace.CurrentCamera
+    if not (root and cam) then return end
+    if not (flyBV and flyBV.Parent == root and flyBG and flyBG.Parent == root) then
+        if os.clock() - lastFlyHeal < 0.5 then return end
+        lastFlyHeal = os.clock()
+        ensureFlyMovers(root, hum)
     end
-    local out = "game"
-    for i = #chain, 1, -1 do
-        local node = chain[i]
-        local okN, nm = pcall(function() return node.Name end)
-        nm = okN and nm or "?"
-        if i == #chain then
-            out = 'game:GetService("' .. nm .. '")'
-        elseif isIdentifier(nm) then
-            out = out .. "." .. nm
-        else
-            out = out .. "[" .. quote(nm) .. "]"
+
+    if State.Grind and not State.ScrollTrip then
+        local pos = cam.CFrame.Position
+        cam.CFrame = CFrame.lookAt(pos, root.Position + Vector3.new(0, 90, 0))
+    end
+
+    local dir = Vector3.zero
+    local U = UserInputService
+    if U:IsKeyDown(Enum.KeyCode.W) then dir += cam.CFrame.LookVector end
+    if U:IsKeyDown(Enum.KeyCode.S) then dir -= cam.CFrame.LookVector end
+    if U:IsKeyDown(Enum.KeyCode.D) then dir += cam.CFrame.RightVector end
+    if U:IsKeyDown(Enum.KeyCode.A) then dir -= cam.CFrame.RightVector end
+    if U:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+    if U:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.yAxis end
+    flyBV.Velocity = dir.Magnitude > 0 and dir.Unit * Config.FlySpeed or Vector3.zero
+    flyBG.CFrame = cam.CFrame
+end))
+
+-- ===================== NOCLIP =====================
+track(RunService.Stepped:Connect(function()
+    if not (State.Noclip or State.Grind) then return end
+    local c = LocalPlayer.Character
+    if not c then return end
+    for _, p in ipairs(c:GetChildren()) do
+        if p:IsA("BasePart") then p.CanCollide = false end
+    end
+end))
+
+-- ===================== SPEED / JUMP / INFINITE JUMP =====================
+local defaultWalkSpeed, defaultJumpPower, defaultJumpHeight = 16, 50, 7.2
+
+local function applyMovement()
+    local _, hum = getRoot()
+    if not hum then return end
+    if State.Speed then
+        pcall(function() hum.WalkSpeed = Config.WalkSpeed end)
+    end
+    if State.Jump then
+        pcall(function()
+            hum.UseJumpPower = true
+            hum.JumpPower = Config.JumpPower
+            hum.JumpHeight = Config.JumpHeight
+        end)
+    end
+end
+
+track(RunService.RenderStepped:Connect(function()
+    if State.Speed or State.Jump then
+        applyMovement()
+    end
+end))
+
+track(UserInputService.JumpRequest:Connect(function()
+    local root, hum = getRoot()
+    if not hum then return end
+    if State.Jump then
+        applyMovement()
+        if root then
+            local v = root.AssemblyLinearVelocity
+            local boost = math.max(Config.JumpPower, Config.JumpHeight * 5)
+            if v.Y < boost * 0.5 then
+                root.AssemblyLinearVelocity = Vector3.new(v.X, boost, v.Z)
+            end
+        end
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+    end
+    if State.InfiniteJump then
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+        if root then
+            local v = root.AssemblyLinearVelocity
+            local boost = math.max(Config.JumpPower, Config.JumpHeight * 5)
+            root.AssemblyLinearVelocity = Vector3.new(v.X, boost, v.Z)
         end
     end
+end))
+
+-- ===================== CHARACTER RESPAWN CLEANUP =====================
+track(LocalPlayer.CharacterAdded:Connect(function(newChar)
+    task.spawn(function()
+        local hum = newChar:WaitForChild("Humanoid", 5)
+        local root = newChar:WaitForChild("HumanoidRootPart", 5)
+        if hum then
+            hum.PlatformStand = false
+        end
+        forceReleaseInputs()
+        if State.Grind or State.Fly then
+            State.Fly = true
+            task.wait(0.2)
+            startFly()
+        end
+    end)
+end))
+
+-- ===================== SCROLL ESP =====================
+local BossScrollESP_Folder = Instance.new("Folder")
+BossScrollESP_Folder.Name = "BossScrollTestESP"
+BossScrollESP_Folder.Parent = Workspace
+
+local trackedScrollParts = {}
+
+local MissionFolders = {
+    { folderPath = { "bossdropmission", "missions" }, category = "BOSS" },
+    { folderPath = { "HAPPYmission", "missions" }, category = "HAPPY" },
+    { folderPath = { "Koramamission", "missions" }, category = "KORAMA" },
+    { folderPath = { "missiongivers" }, category = "MISSION GIVER" }
+}
+
+local function getMissionInfo(mission)
+    local giver = mission:FindFirstChild("missiongiver")
+    if not giver then return mission.Name, "Time unknown" end
+
+    local timer = giver:FindFirstChild("timer", true)
+    local timeFolder = timer and timer:FindFirstChild("time", true)
+    local bossLabel = timeFolder and timeFolder:FindFirstChild("boss", true)
+    local timeLabel = timeFolder and (timeFolder:FindFirstChild("timer", true) or timeFolder:FindFirstChild("time", true))
+
+    local bossName = mission.Name
+    if bossLabel and bossLabel:IsA("TextLabel") then
+        bossName = bossLabel.Text:gsub("^%[", ""):gsub("%]$", "")
+    end
+
+    local timeText = "Time unknown"
+    if timeLabel and timeLabel:IsA("TextLabel") then
+        timeText = timeLabel.Text
+    end
+
+    return bossName, timeText
+end
+
+local function createScrollESP(part, mission, category)
+    if trackedScrollParts[part] then return end
+    trackedScrollParts[part] = true
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "BossScrollTestLabel"
+    billboard.Adornee = part
+    billboard.Size = UDim2.new(0, 160, 0, 40)
+    billboard.StudsOffset = Vector3.new(0, 2, 0)
+    billboard.AlwaysOnTop = true
+    billboard.MaxDistance = 2000
+    billboard.Parent = BossScrollESP_Folder
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(100, 200, 255)
+    label.TextStrokeTransparency = 0.3
+    label.TextScaled = false
+    label.TextSize = 12
+    label.Font = Enum.Font.GothamBold
+    label.Parent = billboard
+
+    local function updateFixed()
+        if not mission.Parent or not part.Parent or not State.ESP.ScrollESP then
+            billboard:Destroy()
+            trackedScrollParts[part] = nil
+            return
+        end
+
+        local bossName, timeText = getMissionInfo(mission)
+        label.Text = category .. "\n" .. bossName .. " | " .. timeText
+    end
+
+    updateFixed()
+
+    task.spawn(function()
+        while billboard.Parent and mission.Parent and part.Parent and State.ESP.ScrollESP do
+            updateFixed()
+            task.wait(1.0)
+        end
+        billboard:Destroy()
+        trackedScrollParts[part] = nil
+    end)
+end
+
+local function scanFolder(missionsFolder, category)
+    if not missionsFolder then return end
+    for _, mission in ipairs(missionsFolder:GetChildren()) do
+        local giver = mission:FindFirstChild("missiongiver") or mission
+        if giver then
+            local model = giver:FindFirstChild("Model")
+            local scroll = model and model:FindFirstChild("Meshes/scroll")
+
+            if scroll and scroll:IsA("BasePart") then
+                createScrollESP(scroll, mission, category)
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while Alive do
+        if State.ESP.ScrollESP then
+            for _, entry in ipairs(MissionFolders) do
+                local cur = Workspace
+                for _, n in ipairs(entry.folderPath) do
+                    cur = cur and cur:FindFirstChild(n)
+                end
+                if cur then
+                    scanFolder(cur, entry.category)
+                end
+            end
+        else
+            for part, _ in pairs(trackedScrollParts) do
+                trackedScrollParts[part] = nil
+            end
+            BossScrollESP_Folder:ClearAllChildren()
+        end
+        task.wait(2.0)
+    end
+end)
+
+-- ===================== AUTO QUEST & REMOTE FINDER =====================
+questFolder = function()
+    local cur = Workspace
+    for _, n in ipairs(Config.Quest.Root) do 
+        cur = cur and cur:FindFirstChild(n) 
+    end
+    return cur
+end
+
+local function questRemote(boss)
+    local folder = questFolder()
+    if folder then
+        local cur = folder:FindFirstChild(boss)
+        if cur then
+            for _, n in ipairs(Config.Quest.GiverPath) do 
+                cur = cur and cur:FindFirstChild(n) 
+            end
+            if cur and (cur:IsA("RemoteEvent") or cur:IsA("BaseRemoteEvent")) then
+                return cur
+            end
+        end
+    end
+    
+    local missionsFolder = Workspace:FindFirstChild("bossdropmission")
+    if missionsFolder then
+        local clientTalk = missionsFolder:FindFirstChild("CLIENTTALK", true)
+        if clientTalk then return clientTalk end
+    end
+    
+    return nil
+end
+
+local function normalize(s)
+    return (string.lower(s):gsub("[^%w]", ""))
+end
+
+local function bossMatches(m, key)
+    local nt = m:FindFirstChild("npctype")
+    if nt and nt:IsA("StringValue") and nt.Value ~= "" and normalize(nt.Value) == key then return true end
+    local bd = m:FindFirstChild("bossdrop")
+    if bd and bd:IsA("StringValue") and bd.Value ~= "" then
+        local v = normalize(bd.Value)
+        if v == key .. "char" or v == key then return true end
+    end
+    return false
+end
+
+local visited = setmetatable({}, { __mode = "k" })
+local scriptZeroed = setmetatable({}, { __mode = "k" })
+
+local function findBossPart(boss, fromPos)
+    local key = normalize(boss)
+    local folder = Workspace:FindFirstChild("npc")
+    if not folder then return nil end
+    local bestPart, bestModel, bestD, count = nil, nil, math.huge, 0
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") and not visited[m] and bossMatches(m, key) then
+            local part = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Head") or m:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                count += 1
+                local d = fromPos and (part.Position - fromPos).Magnitude or 0
+                if d < bestD then bestPart, bestModel, bestD = part, m, d end
+            end
+        end
+    end
+    return bestPart, bestModel, count, bestD
+end
+
+local function placeUnder(part, height)
+    if State.ScrollTrip then return false end
+    local root, hum = getRoot()
+    if not (root and part) then return false end
+    root.CFrame = CFrame.new(part.Position + Vector3.new(0, height, 0))
+    root.AssemblyLinearVelocity = Vector3.zero
+    if hum then
+        hum.PlatformStand = State.Fly
+    end
+    return true
+end
+
+local function pressKey(keyCode, hold)
+    if pressing then return end
+    pressing = true
+    heldKeys[keyCode] = true
+    if pcall(sendKey, true, keyCode) then
+        task.wait(hold)
+    end
+    if heldKeys[keyCode] then
+        heldKeys[keyCode] = nil
+        pcall(sendKey, false, keyCode)
+    end
+    pressing = false
+end
+
+local function isLiving(hum)
+    return hum ~= nil and (hum.Health > 0 or scriptZeroed[hum] == true)
+end
+
+local function bossState(boss)
+    local folder = Workspace:FindFirstChild("npc")
+    if not folder then return false, "workspace.npc missing" end
+    local key = normalize(boss)
+    local matched, lastHum = 0, nil
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") and bossMatches(m, key) then
+            matched += 1
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            if isLiving(hum) then
+                return true, "alive"
+            end
+            lastHum = hum or lastHum
+        end
+    end
+    if matched == 0 then
+        return false, "no matching model in workspace.npc"
+    end
+    if lastHum then
+        return false, string.format("%d matching model(s), Humanoid Health %.0f/%.0f", matched, lastHum.Health, lastHum.MaxHealth)
+    end
+    return false, string.format("%d matching model(s) without a Humanoid", matched)
+end
+
+local function findAliveSelectedBoss()
+    local folder = Workspace:FindFirstChild("npc")
+    if not folder then return nil end
+    local living = {}
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") and isLiving(m:FindFirstChildOfClass("Humanoid")) then
+            living[#living + 1] = m
+        end
+    end
+    if #living == 0 then return nil end
+    for _, boss in ipairs(Config.Bosses) do
+        if Config.Quest.Selected[boss] then
+            local key = normalize(boss)
+            for _, m in ipairs(living) do
+                if bossMatches(m, key) then
+                    return boss
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function livingBossPart(boss, fromPos)
+    local folder = Workspace:FindFirstChild("npc")
+    if not folder then return nil end
+    local key = normalize(boss)
+    local bestPart, bestD = nil, math.huge
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") and bossMatches(m, key) and isLiving(m:FindFirstChildOfClass("Humanoid")) then
+            local part = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Head") or m:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                local d = (part.Position - fromPos).Magnitude
+                if d < bestD then bestPart, bestD = part, d end
+            end
+        end
+    end
+    return bestPart, bestD
+end
+
+task.spawn(function()
+    local tracked, aliveAt, deadSince = nil, 0, nil
+    while Alive do
+        local interval = Config.BossScan.ScanInterval
+        pcall(function()
+            if tracked then
+                interval = Config.BossScan.TrackInterval
+                local isAlive, detail = bossState(tracked)
+                if isAlive then
+                    deadSince = nil
+                    State.BossAlive = tracked
+                else
+                    State.BossAlive = nil
+                    deadSince = deadSince or os.clock()
+                    if os.clock() - deadSince >= Config.BossScan.DeadConfirmSeconds then
+                        tracked, deadSince = nil, nil
+                        State.BossAlive = nil
+                        interval = Config.BossScan.ScanInterval
+                    end
+                end
+            else
+                local boss = findAliveSelectedBoss()
+                if boss then
+                    tracked, aliveAt, deadSince = boss, os.clock(), nil
+                    State.BossAlive = boss
+                    interval = Config.BossScan.TrackInterval
+                end
+            end
+        end)
+        task.wait(interval)
+    end
+end)
+
+-- ===================== PLAYER / BOSS NPC ESP =====================
+local ESP_Folder = Instance.new("Folder")
+ESP_Folder.Name = "EggzyESP"
+ESP_Folder.Parent = Workspace
+
+local espKinds = { "Players", "BossNPCESP" }
+local espObjects = { Players = {}, BossNPCESP = {} }
+local espMatchCache = {
+    Players = setmetatable({}, { __mode = "k" }),
+    BossNPCESP = setmetatable({}, { __mode = "k" }),
+}
+
+local function espMatches(kind, model)
+    local cache = espMatchCache[kind]
+    local hit = cache[model]
+    local now = os.clock()
+    if hit and (hit.ok or now - hit.at < 2) then return hit.ok end
+    local ok, res = pcall(Config.ESP[kind].Match, model)
+    res = ok and res == true
+    cache[model] = { ok = res, at = now }
+    return res
+end
+
+local function espAdornee(kind, model)
+    local cfg = Config.ESP[kind]
+    if cfg.Adornee then
+        local ok, part = pcall(cfg.Adornee, model)
+        if ok and typeof(part) == "Instance" and part:IsA("BasePart") then return part end
+    end
+    return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
+        or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function destroyEsp(entry)
+    pcall(function() entry.gui:Destroy() end)
+    if entry.highlight then
+        pcall(function() entry.highlight:Destroy() end)
+    end
+end
+
+local function fmtHP(n)
+    if n >= 1e6 then
+        return string.format("%.1fM", n / 1e6)
+    elseif n >= 1e3 then
+        return string.format("%.1fK", n / 1e3)
+    end
+    return string.format("%d", math.floor(n + 0.5))
+end
+
+local function bossDisplayName(model)
+    local raw = {}
+    local nt = model:FindFirstChild("npctype")
+    if nt and nt:IsA("StringValue") and nt.Value ~= "" then
+        raw[#raw + 1] = normalize(nt.Value)
+    end
+    local bd = model:FindFirstChild("bossdrop")
+    if bd and bd:IsA("StringValue") and bd.Value ~= "" then
+        local v = normalize(bd.Value)
+        raw[#raw + 1] = v
+        raw[#raw + 1] = (v:gsub("char$", ""))
+    end
+    for _, boss in ipairs(Config.Bosses) do
+        local key = normalize(boss)
+        for _, r in ipairs(raw) do
+            if r == key then return boss end
+        end
+    end
+    return model.Name
+end
+
+local function createEsp(kind, model, part)
+    local color = Config.ESP[kind].Color
+    local labelPart = model:FindFirstChild("Head") or part
+
+    local gui = Instance.new("BillboardGui")
+    gui.Name = "EggzyESPLabel"
+    gui.Adornee = labelPart
+    gui.Size = UDim2.fromOffset(200, 32)
+    gui.StudsOffset = Vector3.new(0, labelPart.Size.Y / 2 + 2, 0)
+    gui.AlwaysOnTop = true
+    gui.MaxDistance = Config.ESPSettings.MaxDistance
+    gui.Parent = ESP_Folder
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, 0, 0, 16)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.TextColor3 = color
+    nameLabel.TextStrokeTransparency = 0.3
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextSize = 13
+    nameLabel.Parent = gui
+
+    local infoLabel = Instance.new("TextLabel")
+    infoLabel.Position = UDim2.new(0, 0, 0, 16)
+    infoLabel.Size = UDim2.new(1, 0, 0, 16)
+    infoLabel.BackgroundTransparency = 1
+    infoLabel.TextColor3 = Color3.fromRGB(235, 235, 240)
+    infoLabel.TextStrokeTransparency = 0.3
+    infoLabel.Font = Enum.Font.GothamMedium
+    infoLabel.TextSize = 11
+    infoLabel.Parent = gui
+
+    return { part = part, gui = gui, nameLabel = nameLabel, infoLabel = infoLabel, highlight = nil }
+end
+
+local function setHighlight(entry, model, kind, on)
+    if on then
+        if not entry.highlight then
+            local hl = Instance.new("Highlight")
+            hl.Name = "EggzyESPHighlight"
+            hl.Adornee = model
+            hl.FillTransparency = 1
+            hl.OutlineColor = Config.ESP[kind].Color
+            hl.OutlineTransparency = 0
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Parent = ESP_Folder
+            entry.highlight = hl
+        end
+    elseif entry.highlight then
+        pcall(function() entry.highlight:Destroy() end)
+        entry.highlight = nil
+    end
+end
+
+local function espCandidates(kind)
+    local list = {}
+    if kind == "Players" then
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and plr.Character then
+                list[#list + 1] = plr.Character
+            end
+        end
+    else
+        local folder = Workspace:FindFirstChild("npc")
+        if folder then
+            for _, m in ipairs(folder:GetChildren()) do
+                list[#list + 1] = m
+            end
+        end
+    end
+    return list
+end
+
+local function clearEsp(kind)
+    for model, entry in pairs(espObjects[kind]) do
+        destroyEsp(entry)
+        espObjects[kind][model] = nil
+    end
+end
+
+local function scanEsp(kind)
+    local objects = espObjects[kind]
+    local seen = {}
+    local active = {}
+    local myRoot = getRoot()
+    local fromPos = myRoot and myRoot.Position
+    for _, model in ipairs(espCandidates(kind)) do
+        if model:IsA("Model") and model ~= LocalPlayer.Character and espMatches(kind, model) then
+            local hum = model:FindFirstChildOfClass("Humanoid")
+            local part = espAdornee(kind, model)
+            if part and (not hum or isLiving(hum)) then
+                seen[model] = true
+                local entry = objects[model]
+                if entry and entry.part ~= part then
+                    destroyEsp(entry)
+                    entry = nil
+                end
+                if not entry then
+                    entry = createEsp(kind, model, part)
+                    objects[model] = entry
+                end
+                local dist = fromPos and (part.Position - fromPos).Magnitude or 0
+                active[#active + 1] = { model = model, entry = entry, dist = dist }
+
+                if kind == "BossNPCESP" then
+                    if not entry.name or entry.name == model.Name then
+                        entry.name = bossDisplayName(model)
+                    end
+                else
+                    entry.name = entry.name or model.Name
+                end
+                entry.nameLabel.Text = entry.name
+
+                local infoText = ""
+                if hum then
+                    local maxHp = math.max(hum.MaxHealth, 1)
+                    if scriptZeroed[hum] and hum.Health <= 0 then
+                        infoText = string.format("HP ? / %s", fmtHP(maxHp))
+                    else
+                        local frac = math.clamp(hum.Health / maxHp, 0, 1)
+                        infoText = string.format("HP %s / %s (%d%%)", fmtHP(hum.Health), fmtHP(maxHp), math.floor(frac * 100 + 0.5))
+                    end
+                end
+                if fromPos then
+                    infoText = infoText .. (infoText ~= "" and "  |  " or "") .. math.floor(dist + 0.5) .. " studs"
+                end
+                entry.infoLabel.Text = infoText
+            end
+        end
+    end
+
+    table.sort(active, function(a, b) return a.dist < b.dist end)
+    for i, a in ipairs(active) do
+        setHighlight(a.entry, a.model, kind, i <= Config.ESPSettings.MaxHighlights)
+    end
+
+    for model, entry in pairs(objects) do
+        if not seen[model] then
+            destroyEsp(entry)
+            objects[model] = nil
+        end
+    end
+end
+
+task.spawn(function()
+    while Alive do
+        for _, kind in ipairs(espKinds) do
+            if State.ESP[kind] then
+                pcall(scanEsp, kind)
+            else
+                clearEsp(kind)
+            end
+        end
+        task.wait(Config.ESPSettings.ScanInterval)
+    end
+end)
+
+-- ===================== Q SPAM =====================
+local windowFocused = true
+track(UserInputService.WindowFocused:Connect(function()
+    windowFocused = true
+end))
+track(UserInputService.InputChanged:Connect(function()
+    windowFocused = true
+end))
+track(UserInputService.WindowFocusReleased:Connect(function()
+    windowFocused = false
+    forceReleaseInputs()
+end))
+
+task.spawn(function()
+    local armedFor, armedAt, nextPress = nil, 0, 0
+    while Alive do
+        local cfg = Config.BossScan
+        local boss = State.BossAlive
+        if boss ~= armedFor then
+            armedFor = boss
+            armedAt = os.clock() + cfg.SpamFirstDelay
+            nextPress = armedAt
+        end
+        
+        if cfg.SpamQ and boss and os.clock() >= armedAt and windowFocused and not UserInputService:GetFocusedTextBox() then
+            local root = getRoot()
+            if root then
+                local part, dist = livingBossPart(boss, root.Position)
+                if part and dist <= cfg.SpamRange and os.clock() >= nextPress then
+                    pressKey(cfg.SpamKey, cfg.SpamHold)
+                    nextPress = os.clock() + cfg.SpamPeriod
+                end
+            end
+        end
+        task.wait(0.2)
+    end
+end)
+
+-- ===================== INPUT PANIC =====================
+local function panic()
+    forceReleaseInputs()
+    pcall(function()
+        local tb = UserInputService:GetFocusedTextBox()
+        if tb then tb:ReleaseFocus() end
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        UserInputService.MouseIconEnabled = true
+    end)
+    Config.BossScan.SpamQ = not Config.BossScan.SpamQ
+end
+
+track(UserInputService.InputBegan:Connect(function(input)
+    if input.KeyCode == Config.PanicKey then
+        panic()
+    end
+end))
+
+pcall(function()
+    getgenv().EggzyPanic = panic
+end)
+
+-- ===================== PRECISE Q THROWER LOOP =====================
+task.spawn(function()
+    local nextPress = os.clock() + 19
+    while Alive do
+        if State.Grind then
+            local now = os.clock()
+            if now >= nextPress then
+                local root, _ = getRoot()
+                if root then
+                    local folder = Workspace:FindFirstChild("npc")
+                    if folder then
+                        local bestPart, bestD = nil, math.huge
+                        for _, m in ipairs(folder:GetChildren()) do
+                            if m:IsA("Model") then
+                                local part = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Head")
+                                if part then
+                                    local d = (part.Position - root.Position).Magnitude
+                                    if d < bestD then
+                                        bestD = d
+                                        bestPart = part
+                                    end
+                                end
+                            end
+                        end
+                        if bestPart then
+                            root.CFrame = CFrame.lookAt(root.Position, Vector3.new(bestPart.Position.X, root.Position.Y, bestPart.Position.Z))
+                        end
+                    end
+                end
+                pressKey(Config.Grind.Key, Config.Grind.KeyHold)
+                nextPress = now + 19
+            end
+        else
+            nextPress = os.clock() + 19
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ===================== BOSS DISTANCE CHECK MONITOR =====================
+task.spawn(function()
+    while Alive do
+        task.wait(1.0)
+        if State.Grind and not State.Returning then
+            local root, _ = getRoot()
+            if root then
+                local folder = Workspace:FindFirstChild("npc")
+                if folder then
+                    for _, m in ipairs(folder:GetChildren()) do
+                        if m:IsA("Model") then
+                            local part = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Head")
+                            if part then
+                                local yDiff = part.Position.Y - root.Position.Y
+                                if yDiff > 500 then
+                                    sendChat("!cancel")
+                                    task.wait(2)
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- ===================== GRIND CYCLE LOGIC =====================
+local lastEngaged = os.clock()
+
+local function grindStep(boss)
+    local g = Config.Grind
+    local waitStart = os.clock()
+    local nextFire = waitStart + Config.Quest.Interval
+    local part, model, foundBoss
+    while Alive and State.Grind and State.AutoQuest and os.clock() < waitStart + g.WaitSeconds do
+        local root = getRoot()
+        local fromPos = root and root.Position
+        part, model = findBossPart(boss, fromPos)
+        if part then
+            foundBoss = boss
+            break
+        end
+        for _, other in ipairs(Config.Bosses) do
+            if other ~= boss and Config.Quest.Selected[other] then
+                part, model = findBossPart(other, fromPos)
+                if part then
+                    foundBoss = other
+                    break
+                end
+            end
+        end
+        if foundBoss then break end
+        if os.clock() >= nextFire then
+            nextFire = os.clock() + Config.Quest.Interval
+            local r = questRemote(boss)
+            if r then
+                pcall(function() r:FireServer(LocalPlayer) end)
+            end
+        end
+        task.wait(g.Poll)
+    end
+    if not foundBoss then
+        return false
+    end
+    local engagedAt = os.clock()
+    lastEngaged = engagedAt
+    visited[model] = true
+    local currentHeight = getBossHeight(foundBoss)
+    placeUnder(part, currentHeight)
+
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local hit = Config.Kill.UseHitRemote and LocalPlayer:FindFirstChild(Config.Kill.RemoteName)
+    local untilT = os.clock() + g.KillSeconds
+
+    while Alive and State.Grind and os.clock() < untilT and model.Parent do
+        placeUnder(part, currentHeight)
+        
+        local _, localHum = getRoot()
+        if localHum then
+            pcall(function()
+                if localHum.MaxHealth < 300000 then
+                    localHum.MaxHealth = 300000
+                end
+                localHum.Health = 300000
+            end)
+        end
+
+        local isDead = (hum and hum.Health <= 0) or (not hum) or (not model.Parent)
+
+        if not isDead then
+            if hit and hit:IsA("BaseRemoteEvent") then 
+                pcall(hit.FireServer, hit, "target", part) 
+            end
+            if hum then
+                scriptZeroed[hum] = true
+                pcall(function() hum.Health = 0 end)
+            end
+        else
+            break
+        end
+        task.wait(g.KillStep)
+    end
+    return true
+end
+
+-- ===================== RESET RETURN HELPERS =====================
+local function waitForNewCharacter(oldChar, timeout)
+    local deadline = os.clock() + timeout
+    while Alive and State.Grind and os.clock() < deadline do
+        local c = LocalPlayer.Character
+        if c and c ~= oldChar and c.Parent then
+            local root = c:FindFirstChild("HumanoidRootPart")
+            local hum = c:FindFirstChildOfClass("Humanoid")
+            if root and hum and hum.Health > 0 then
+                return c
+            end
+        end
+        task.wait(0.2)
+    end
+    return nil
+end
+
+local function returnToBoss(boss)
+    local t = Config.Teleport
+    local height = getBossHeight(boss)
+    local deadline = os.clock() + t.ReturnSeconds
+    local nextQuest = 0
+    while Alive and State.Grind and os.clock() < deadline do
+        local root = getRoot()
+        if root then
+            if os.clock() >= nextQuest then
+                nextQuest = os.clock() + Config.Quest.Interval
+                local r = questRemote(boss)
+                if r then pcall(function() r:FireServer(LocalPlayer) end) end
+            end
+            local part, model = findBossPart(boss, root.Position)
+            local bossHum = model and model:FindFirstChildOfClass("Humanoid")
+            if part and not (bossHum and bossHum.Health <= 0) then
+                local target = part.Position + Vector3.new(0, height, 0)
+                placeUnder(part, height)
+                task.wait(t.VerifyWait)
+                local after = getRoot()
+                local dist = after and (after.Position - target).Magnitude
+                if dist and dist <= t.VerifyRadius then
+                    return true
+                end
+            end
+        end
+        task.wait(t.ReturnPoll)
+    end
+    return false
+end
+
+task.spawn(function()
+    while Alive do
+        task.wait(2.0)
+        if State.AutoQuest and not State.Grind then
+            for _, boss in ipairs(Config.Bosses) do
+                if not (Alive and State.AutoQuest and not State.Grind) then break end
+                if Config.Quest.Selected[boss] then
+                    task.spawn(function()
+                        local success, r = pcall(questRemote, boss)
+                        if success and r then
+                            pcall(function() r:FireServer(LocalPlayer) end)
+                        end
+                    end)
+                    task.wait(Config.Quest.Stagger)
+                end
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while Alive do
+        task.wait(1.0)
+        if State.Grind then
+            State.AutoQuest = true
+            State.TpScroll = true
+            State.Kill = true
+            
+            local activeBoss = nil
+            for _, boss in ipairs(Config.Bosses) do
+                if Config.Quest.Selected[boss] then
+                    activeBoss = boss
+                    break
+                end
+            end
+            
+            if not activeBoss then
+                activeBoss = Config.Bosses[1]
+                Config.Quest.Selected[activeBoss] = true
+            end
+
+            local startTime = os.clock()
+            lastEngaged = os.clock()
+            while Alive and State.Grind and (os.clock() - startTime < Config.Grind.ResetInterval) do
+                local cycled = false
+                for _, boss in ipairs(Config.Bosses) do
+                    if not (Alive and State.Grind) then break end
+                    if Config.Quest.Selected[boss] then
+                        cycled = true
+                        activeBoss = boss
+                        if os.clock() - lastEngaged > Config.Grind.StallSeconds then
+                            table.clear(visited)
+                            lastEngaged = os.clock()
+                        end
+                        
+                        task.spawn(function()
+                            local success, r = pcall(questRemote, boss)
+                            if success and r then
+                                pcall(function() r:FireServer(LocalPlayer) end)
+                            end
+                        end)
+                        
+                        pcall(function()
+                            grindStep(boss)
+                        end)
+                        
+                        task.wait(Config.Quest.Stagger)
+                    end
+                end
+                if not cycled then
+                    task.wait(1)
+                end
+            end
+
+            if Alive and State.Grind then
+                local char = LocalPlayer.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    pcall(function() 
+                        hum.Health = 0 
+                        hum:TakeDamage(hum.MaxHealth) 
+                    end)
+                elseif char then
+                    pcall(function() char:BreakJoints() end)
+                end
+
+                State.Returning = true
+                pcall(function()
+                    local newChar = waitForNewCharacter(char, Config.Teleport.RespawnTimeout)
+                    if not newChar then return end
+                    task.wait(0.8)
+                    if not State.Grind then return end
+
+                    table.clear(visited)
+                    State.Fly = true
+                    startFly()
+
+                    local newRoot = getRoot()
+                    local cam = Workspace.CurrentCamera
+                    if cam and newRoot then
+                        local pos = cam.CFrame.Position
+                        cam.CFrame = CFrame.lookAt(pos, newRoot.Position + Vector3.new(0, 90, 0))
+                    end
+
+                    forceReleaseInputs()
+                    returnToBoss(activeBoss)
+                end)
+                State.Returning = false
+            end
+        end
+    end
+end)
+
+-- ===================== INSTANT KILL =====================
+task.spawn(function()
+    while Alive and task.wait(Config.Kill.Interval) do
+        if State.Kill then
+            local root, _ = getRoot()
+            if root then
+                local npcFolder = Workspace:FindFirstChild("npc")
+                if npcFolder then
+                    local near = {}
+                    for _, model in ipairs(npcFolder:GetChildren()) do
+                        if model:IsA("Model") and model ~= LocalPlayer.Character then
+                            local h = model:FindFirstChildOfClass("Humanoid")
+                            if h and h.Health > 0 then
+                                local part = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Head")
+                                if part then
+                                    local d = (part.Position - root.Position).Magnitude
+                                    if d <= Config.Kill.Range then 
+                                        table.insert(near, { h = h, part = part, d = d }) 
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    table.sort(near, function(a, b) return a.d < b.d end)
+                    local r = Config.Kill.UseHitRemote and LocalPlayer:FindFirstChild(Config.Kill.RemoteName)
+                    for i, t in ipairs(near) do
+                        if r and r:IsA("BaseRemoteEvent") and i <= Config.Kill.MaxHits then
+                            pcall(r.FireServer, r, "target", t.part)
+                        end
+                        if t.h.Health > 0 then
+                            scriptZeroed[t.h] = true
+                            pcall(function() 
+                                t.h.Health = 0 
+                                local maxHp = tonumber(t.h.MaxHealth)
+                                if maxHp then
+                                    t.h:TakeDamage(maxHp)
+                                end
+                            end)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- ===================== AUTO MENTOR =====================
+-- Flow: detect mentor -> FireServer(LocalPlayer) on that mentor's CLIENTTALK -> M1 once per
+-- M1Period for M1Count presses -> talk again. Pauses while Money Grind is on.
+-- UNKNOWN: what the game sends back when the mission is accepted or finished. The M1 phase
+-- therefore starts right after the talk remote fires without error, and runs exactly M1Count presses.
+local MentorInfo = { name = nil, source = "none", phase = "off" }
+local MENTOR_SKIP = { PlayerGui = true, Backpack = true, PlayerScripts = true }
+
+local function mentorMissionsFolder()
+    local cur = Workspace
+    for _, n in ipairs(Config.Mentor.RootPath) do
+        cur = cur and cur:FindFirstChild(n)
+    end
+    return cur
+end
+
+local function mentorRemoteFor(name)
+    local cur = mentorMissionsFolder()
+    cur = cur and cur:FindFirstChild(name)
+    for _, n in ipairs(Config.Mentor.GiverPath) do
+        cur = cur and cur:FindFirstChild(n)
+    end
+    if cur and cur:IsA("BaseRemoteEvent") then
+        return cur
+    end
+    return nil
+end
+
+-- Collects string-ish values stored on the local player (values, object values, string attributes).
+-- Skips PlayerGui/Backpack/PlayerScripts, depth-limited so it stays cheap.
+local function mentorCandidates()
+    local out = {}
+    local kws = Config.Mentor.DetectKeywords
+    local function keyHit(n)
+        local l = string.lower(n)
+        for _, kw in ipairs(kws) do
+            if l:find(kw, 1, true) then return true end
+        end
+        return false
+    end
+    local function visit(inst, path, depth)
+        local kw = keyHit(inst.Name)
+        if inst:IsA("StringValue") then
+            out[#out + 1] = { path = path, raw = inst.Value, kw = kw }
+        elseif inst:IsA("ObjectValue") and inst.Value then
+            out[#out + 1] = { path = path, raw = inst.Value.Name, kw = kw }
+        end
+        for k, v in pairs(inst:GetAttributes()) do
+            if type(v) == "string" then
+                out[#out + 1] = { path = path .. "@" .. k, raw = v, kw = keyHit(k) }
+            end
+        end
+        if depth < 3 then
+            for _, c in ipairs(inst:GetChildren()) do
+                if not (depth == 0 and MENTOR_SKIP[c.Name]) then
+                    visit(c, path .. "." .. c.Name, depth + 1)
+                end
+            end
+        end
+    end
+    visit(LocalPlayer, "LocalPlayer", 0)
     return out
 end
 
-local function serialize(v, depth, seen)
-    local t = typeof(v)
-    if t == "string" then
-        return quote(v)
-    elseif t == "number" then
-        if v ~= v then return "0/0" end
-        if v == math.huge then return "math.huge" end
-        if v == -math.huge then return "-math.huge" end
-        return tostring(v)
-    elseif t == "boolean" or t == "nil" then
-        return tostring(v)
-    elseif t == "Instance" then
-        if v == LocalPlayer then return "game:GetService(\"Players\").LocalPlayer" end
-        return instancePath(v)
-    elseif t == "Vector3" then
-        return string.format("Vector3.new(%s, %s, %s)", v.X, v.Y, v.Z)
-    elseif t == "Vector2" then
-        return string.format("Vector2.new(%s, %s)", v.X, v.Y)
-    elseif t == "CFrame" then
-        local c = { v:GetComponents() }
-        for i = 1, #c do c[i] = tostring(c[i]) end
-        return "CFrame.new(" .. table.concat(c, ", ") .. ")"
-    elseif t == "Color3" then
-        return string.format("Color3.new(%s, %s, %s)", v.R, v.G, v.B)
-    elseif t == "UDim2" then
-        return string.format("UDim2.new(%s, %s, %s, %s)", v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset)
-    elseif t == "EnumItem" then
-        return tostring(v)
-    elseif t == "table" then
-        if seen[v] then return "{ --[[ cycle ]] }" end
-        if depth >= Config.MaxDepth then return "{ --[[ depth limit ]] }" end
-        seen[v] = true
-        local parts, count = {}, 0
-        local isArray = #v > 0
-        for k, val in pairs(v) do
-            count += 1
-            if count > Config.MaxTableEntries then
-                parts[#parts + 1] = "--[[ more entries ]]"
-                break
-            end
-            if isArray and type(k) == "number" then
-                parts[#parts + 1] = serialize(val, depth + 1, seen)
-            elseif isIdentifier(k) then
-                parts[#parts + 1] = k .. " = " .. serialize(val, depth + 1, seen)
-            else
-                parts[#parts + 1] = "[" .. serialize(k, depth + 1, seen) .. "] = " .. serialize(val, depth + 1, seen)
-            end
+local function detectMentorName()
+    local folder = mentorMissionsFolder()
+    if not folder then
+        return nil, "missing Workspace." .. table.concat(Config.Mentor.RootPath, ".")
+    end
+    local byKey = {}
+    for _, m in ipairs(folder:GetChildren()) do
+        byKey[normKey(m.Name)] = m.Name
+    end
+    local cands = mentorCandidates()
+    table.sort(cands, function(a, b) return (a.kw and 1 or 0) > (b.kw and 1 or 0) end)
+    for _, c in ipairs(cands) do
+        local key = normKey(c.raw)
+        if key ~= "" and byKey[key] then
+            return byKey[key], "player data: " .. c.path
         end
-        seen[v] = nil
-        return "{ " .. table.concat(parts, ", ") .. " }"
-    else
-        return "nil --[[ " .. t .. " ]]"
+    end
+    local def = Config.Mentor.Default
+    if def and byKey[normKey(def)] then
+        return byKey[normKey(def)], "default (captured)"
+    end
+    return nil, "no match"
+end
+
+local function clickM1(hold)
+    if pressing then return false end
+    pressing = true
+    mouseHeld = true
+    local ok = pcall(sendMouse, true)
+    if ok then task.wait(hold) end
+    if mouseHeld then
+        mouseHeld = false
+        pcall(sendMouse, false)
+    end
+    pressing = false
+    return ok
+end
+
+-- Holds Space for `hold` seconds and also sets Humanoid.Jump, so it works whether the game
+-- reads the key or the humanoid. The key is always released, even on panic or toggle-off.
+local function holdJump(hold)
+    local deadline = os.clock() + 2
+    while pressing and os.clock() < deadline do
+        task.wait(0.05)
+    end
+    if pressing then return false end
+    pressing = true
+    local space = Enum.KeyCode.Space
+    heldKeys[space] = true
+    pcall(sendKey, true, space)
+    -- Only the real Space key is held. Setting Humanoid.Jump here made a normal jump on top of the tree jump.
+    local sawReady = false
+    local startedAt = os.clock()
+    local reported = false
+    local untilT = startedAt + hold
+    while Alive and State.Mentor and os.clock() < untilT do
+        if LocalPlayer:GetAttribute("treejumpready") == true then sawReady = true end
+        if Config.Debug and not reported and os.clock() - startedAt >= 0.25 then
+            reported = true
+            local r, h = getRoot()
+            local look = r and r.CFrame.LookVector
+            local heading = look and (math.deg(math.atan2(look.X, -look.Z)) % 360)
+            print(string.format("[EggzyMentor] Space held 0.25s: stick=%s ready=%s state=%s pos=%s heading=%s",
+                tostring(r and r:FindFirstChild("stick") ~= nil), tostring(sawReady),
+                tostring(h and h:GetState()), tostring(r and r.Position),
+                heading and string.format("%.1f", heading) or "?"))
+        end
+        task.wait(0.05)
+    end
+    if heldKeys[space] then
+        heldKeys[space] = nil
+        pcall(sendKey, false, space)
+    end
+    pressing = false
+    return true, sawReady
+end
+
+-- Training 2: teleport to TeleportTo, wait until the character is at WaitAt, hold jump,
+-- wait AfterJumpWait, then teleport to ReturnTo.
+-- Returns true when the character reached WaitAt. Always attempts the return teleport.
+local mentorFaceLock = false
+
+local function headingDirection(deg)
+    local r = math.rad(deg)
+    return Vector3.new(math.sin(r), 0, -math.cos(r))
+end
+
+-- Facing lock. Every render frame, after the camera script has run, it
+--   1) turns Humanoid.AutoRotate off so the humanoid stops steering the character,
+--   2) sets the root CFrame to the heading and holds it with a BodyGyro (beats scripts that add torque),
+--   3) turns the camera to the same heading (keeps its pitch), because many games rotate the character toward the camera.
+-- It is released when the loop talks to the mentor again, when Auto Mentor / training 2 is switched off, or on unload.
+local FACE_BIND = "EggzyMentorFace"
+local faceGyro, faceBound = nil, false
+local faceSuspended = false
+
+-- Suspended during the tree jump itself: the game builds its own AlignPosition / AlignOrientation then,
+-- and a per-frame CFrame + BodyGyro rewrite from us fights it (SpaceTest worked only with nothing fighting).
+local function suspendFaceLock()
+    faceSuspended = true
+    if faceGyro then
+        pcall(function() faceGyro:Destroy() end)
+        faceGyro = nil
     end
 end
 
-local function serializeArgs(args, n)
-    local parts = {}
-    for i = 1, n do
-        parts[i] = serialize(args[i], 0, {})
+local function stopFaceLock()
+    mentorFaceLock = false
+    faceSuspended = false
+    if faceBound then
+        faceBound = false
+        pcall(function() RunService:UnbindFromRenderStep(FACE_BIND) end)
     end
-    return table.concat(parts, ", ")
+    if faceGyro then
+        pcall(function() faceGyro:Destroy() end)
+        faceGyro = nil
+    end
+    local _, hum = getRoot()
+    if hum then pcall(function() hum.AutoRotate = true end) end
 end
 
--- ---------------------------------------------------------------- log state
-local Alive = true
-local Paused = false
-local Lines = {}           -- { text = string, call = string }
-local FullLog = {}         -- everything, for Save (capped)
-local Muted = {}           -- remote full path -> true
-local Counters = {}        -- remote full path -> { start = clock, n = count }
-local Filter = ""
-local onLogChanged = nil
-
-local function pushLog(header, callLine)
-    local entry = { text = header, call = callLine }
-    Lines[#Lines + 1] = entry
-    if #Lines > Config.MaxLines then table.remove(Lines, 1) end
-    FullLog[#FullLog + 1] = header .. "\n" .. callLine
-    if #FullLog > 2000 then table.remove(FullLog, 1) end
-    if onLogChanged then onLogChanged() end
-end
-
-local function handleCall(remote, method, args, n)
-    if not Alive or Paused then return end
-    local okPath, path = pcall(instancePath, remote)
-    if not okPath then return end
-
-    local now = os.clock()
-    local c = Counters[path]
-    if not c or now - c.start > Config.ThrottleWindow then
-        c = { start = now, n = 0 }
-        Counters[path] = c
-    end
-    c.n += 1
-    if Muted[path] then return end
-    if c.n > Config.ThrottleCalls then
-        Muted[path] = true
-        pushLog(string.format("[%s] AUTO-MUTED (fires too often): %s", os.date("%H:%M:%S"), remote.Name), "-- " .. path)
+local function applyFace()
+    if not (Alive and State.Mentor and Config.Mentor.Mission == 2) then
+        stopFaceLock()
         return
     end
-
-    local okArgs, argText = pcall(serializeArgs, args, n)
-    if not okArgs then argText = "--[[ could not print arguments ]]" end
-    local header = string.format("[%s] %s  %s  (%d arg%s)", os.date("%H:%M:%S"), method, remote.Name, n, n == 1 and "" or "s")
-    local callLine = string.format("%s:%s(%s)", path, method, argText)
-    pushLog(header, callLine)
+    if faceSuspended then return end
+    local root, hum = getRoot()
+    if not root then return end
+    local dir = headingDirection(Config.Mentor.Training2.Facing)
+    local pos = root.Position
+    local cf = CFrame.lookAt(pos, pos + dir)
+    if hum then hum.AutoRotate = false end
+    root.CFrame = cf
+    root.AssemblyAngularVelocity = Vector3.zero
+    if not (faceGyro and faceGyro.Parent == root) then
+        if faceGyro then pcall(function() faceGyro:Destroy() end) end
+        faceGyro = Instance.new("BodyGyro")
+        faceGyro.MaxTorque = Vector3.new(1e6, 1e6, 1e6)
+        faceGyro.P = 9e4
+        faceGyro.Parent = root
+    end
+    faceGyro.CFrame = cf
+    local cam = Workspace.CurrentCamera
+    if cam then
+        local cl = cam.CFrame.LookVector
+        local horiz = math.sqrt(math.max(0, 1 - cl.Y * cl.Y))
+        local look = Vector3.new(dir.X * horiz, cl.Y, dir.Z * horiz)
+        local camPos = cam.CFrame.Position
+        cam.CFrame = CFrame.lookAt(camPos, camPos + look)
+    end
 end
 
--- ---------------------------------------------------------------- hook
-local Queue = {}
-local Methods = { FireServer = true, InvokeServer = true }
-local original
-original = hookmetamethod_(game, "__namecall", newcclosure_(function(self, ...)
-    local method = getnamecallmethod_()
-    if Alive and Methods[method] and (Config.ShowOwnCalls or not checkcaller_()) then
-        local okClass, isRemote = pcall(function()
-            return typeof(self) == "Instance"
-                and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction") or self:IsA("UnreliableRemoteEvent"))
-        end)
-        if okClass and isRemote then
-            local n = select("#", ...)
-            local args = { ... }
-            Queue[#Queue + 1] = { self, method, args, n } -- processed on Heartbeat (the hook thread has no UI capability)
-            if #Queue > 500 then table.remove(Queue, 1) end
+local function startFaceLock()
+    mentorFaceLock = true
+    if not faceBound then
+        faceBound = true
+        RunService:BindToRenderStep(FACE_BIND, Enum.RenderPriority.Camera.Value + 1, applyFace)
+    end
+end
+
+local function runTraining2()
+    local t = Config.Mentor.Training2
+    local root = getRoot()
+    if not root then return false end
+    local dir = headingDirection(t.Facing)
+    startFaceLock()
+
+    local function goBack()
+        local r = getRoot()
+        if r then
+            if Config.Debug then
+                print(string.format("[EggzyMentor] %.2f BACK-TP from %s to %s", os.clock(), tostring(r.Position), tostring(t.ReturnTo)))
+                task.delay(0.4, function()
+                    local r2 = getRoot()
+                    if r2 then
+                        print(string.format("[EggzyMentor] %.2f 0.4s after back-tp, pos=%s (moved %.1f studs from ReturnTo)",
+                            os.clock(), tostring(r2.Position), (r2.Position - t.ReturnTo).Magnitude))
+                    end
+                end)
+            end
+            r.CFrame = CFrame.lookAt(t.ReturnTo, t.ReturnTo + dir)
+            r.AssemblyLinearVelocity = Vector3.zero
         end
     end
-    return original(self, ...)
-end))
-
--- ---------------------------------------------------------------- window
-local parentGui
-do
-    local okHui, hui = pcall(function() return gethui and gethui() end)
-    parentGui = (okHui and hui) or game:GetService("CoreGui")
-end
-
-local old = parentGui:FindFirstChild("WrenchSpyGui")
-if old then old:Destroy() end
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "WrenchSpyGui"
-gui.ResetOnSpawn = false
-gui.DisplayOrder = 999
-gui.Parent = parentGui
-
-local win = Instance.new("Frame")
-win.Size = UDim2.fromOffset(560, 380)
-win.Position = UDim2.fromOffset(40, 80)
-win.BackgroundColor3 = Color3.fromRGB(30, 30, 33)
-win.BackgroundTransparency = 0.1
-win.BorderSizePixel = 0
-win.Active = true
-win.Draggable = true
-win.Parent = gui
-Instance.new("UICorner", win).CornerRadius = UDim.new(0, 8)
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -12, 0, 26)
-title.Position = UDim2.fromOffset(10, 4)
-title.BackgroundTransparency = 1
-title.Text = "WrenchSpy  -  do the action once, then Copy"
-title.TextColor3 = Color3.fromRGB(235, 235, 240)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 13
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = win
-
-local function makeButton(text, x, w)
-    local b = Instance.new("TextButton")
-    b.Size = UDim2.fromOffset(w, 24)
-    b.Position = UDim2.fromOffset(x, 32)
-    b.BackgroundColor3 = Color3.fromRGB(52, 52, 58)
-    b.Text = text
-    b.TextColor3 = Color3.fromRGB(230, 230, 235)
-    b.Font = Enum.Font.GothamMedium
-    b.TextSize = 12
-    b.AutoButtonColor = true
-    b.BorderSizePixel = 0
-    b.Parent = win
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
-    return b
-end
-
-local pauseBtn = makeButton("Pause", 10, 60)
-local clearBtn = makeButton("Clear", 76, 60)
-local copyBtn = makeButton("Copy all", 142, 76)
-local copyLastBtn = makeButton("Copy last", 224, 76)
-local saveBtn = makeButton("Save file", 306, 76)
-local unmuteBtn = makeButton("Unmute all", 388, 82)
-
-local filterBox = Instance.new("TextBox")
-filterBox.Size = UDim2.fromOffset(530, 24)
-filterBox.Position = UDim2.fromOffset(10, 62)
-filterBox.BackgroundColor3 = Color3.fromRGB(44, 44, 50)
-filterBox.PlaceholderText = "filter (remote name or text), e.g. talk"
-filterBox.Text = ""
-filterBox.TextColor3 = Color3.fromRGB(235, 235, 240)
-filterBox.PlaceholderColor3 = Color3.fromRGB(140, 140, 150)
-filterBox.Font = Enum.Font.Gotham
-filterBox.TextSize = 12
-filterBox.ClearTextOnFocus = false
-filterBox.TextXAlignment = Enum.TextXAlignment.Left
-filterBox.BorderSizePixel = 0
-filterBox.Parent = win
-Instance.new("UICorner", filterBox).CornerRadius = UDim.new(0, 5)
-
-local list = Instance.new("ScrollingFrame")
-list.Size = UDim2.new(1, -20, 1, -98)
-list.Position = UDim2.fromOffset(10, 92)
-list.BackgroundColor3 = Color3.fromRGB(22, 22, 25)
-list.BorderSizePixel = 0
-list.ScrollBarThickness = 5
-list.CanvasSize = UDim2.new()
-list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-list.Parent = win
-Instance.new("UICorner", list).CornerRadius = UDim.new(0, 6)
-
-local layout = Instance.new("UIListLayout", list)
-layout.Padding = UDim.new(0, 4)
-layout.SortOrder = Enum.SortOrder.LayoutOrder
-
-local function lineMatches(entry)
-    if Filter == "" then return true end
-    local f = Filter:lower()
-    return entry.text:lower():find(f, 1, true) ~= nil or entry.call:lower():find(f, 1, true) ~= nil
-end
-
-local function rebuild()
-    for _, child in ipairs(list:GetChildren()) do
-        if child:IsA("TextButton") then child:Destroy() end
+    local function stillOn()
+        return Alive and State.Mentor and not State.Grind
     end
-    local order = 0
-    for _, entry in ipairs(Lines) do
-        if lineMatches(entry) then
-            order += 1
-            local row = Instance.new("TextButton")
-            row.Size = UDim2.new(1, -8, 0, 0)
-            row.AutomaticSize = Enum.AutomaticSize.Y
-            row.BackgroundColor3 = Color3.fromRGB(36, 36, 41)
-            row.BorderSizePixel = 0
-            row.Text = entry.text .. "\n" .. entry.call .. "\n(click to copy this call)"
-            row.TextColor3 = Color3.fromRGB(215, 215, 222)
-            row.Font = Enum.Font.Code
-            row.TextSize = 12
-            row.TextWrapped = true
-            row.TextXAlignment = Enum.TextXAlignment.Left
-            row.TextYAlignment = Enum.TextYAlignment.Top
-            row.LayoutOrder = order
-            row.AutoButtonColor = false
-            row.Parent = list
-            Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
-            row.MouseButton1Click:Connect(function()
-                if setclipboard then pcall(setclipboard, entry.call) end
+
+    if Config.Debug then
+        print(string.format("[EggzyMentor] %.2f SPOT-TP from %s to %s", os.clock(), tostring(root.Position), tostring(t.TeleportTo)))
+    end
+    root.CFrame = CFrame.lookAt(t.TeleportTo, t.TeleportTo + dir)
+    root.AssemblyLinearVelocity = Vector3.zero
+
+    local arrived = false
+    local ok, err = pcall(function()
+        MentorInfo.phase = "t2 waiting to land"
+        local deadline = os.clock() + t.ArriveTimeout
+        while stillOn() and os.clock() < deadline do
+            local r = getRoot()
+            if r and (r.Position - t.WaitAt).Magnitude <= t.ArriveRadius then
+                arrived = true
+                break
+            end
+            task.wait(t.Poll)
+        end
+        if arrived then
+            MentorInfo.phase = "t2 jump"
+            task.wait(t.SettleAfterLand)
+            suspendFaceLock()
+            local r0, h0 = getRoot()
+            if h0 then pcall(function() h0.AutoRotate = true end) end
+            local _, sawReady = holdJump(t.JumpHold)
+            task.delay(0.3, function()
+                if Config.Debug then
+                    print("[EggzyMentor] tree jump: treejumpready seen while holding =", sawReady,
+                        "| injump 0.3s after release =", tostring(LocalPlayer:GetAttribute("injump")))
+                end
+            end)
+            MentorInfo.phase = "t2 waiting to return"
+            local untilT = os.clock() + t.AfterJumpWait
+            while stillOn() and os.clock() < untilT do
+                task.wait(0.05)
+            end
+        end
+    end)
+    goBack()
+    faceSuspended = false
+    if not ok and Config.Debug then
+        print("[EggzyMentor] training 2 error:", err)
+    end
+    if not arrived and Config.Debug then
+        print("[EggzyMentor] training 2: never reached WaitAt, teleported back")
+    end
+    return arrived
+end
+
+-- Training 3: look at the kunaiaim target, throw with M1, count a hit when the target is removed,
+-- replaced by a new instance, or jumps away. One table keeps the main chunk under Luau's local limit.
+local T3 = { aimBound = false, aimTarget = nil, aimUp = false, lastThrowAt = 0 }
+local T3_BIND = "EggzyMentorAim"
+
+function T3.findTarget()
+    local name = Config.Mentor.Training3.TargetName
+    local inst = nil
+    local mine = Workspace.Terrain:FindFirstChild(LocalPlayer.Name)
+    if mine then inst = mine:FindFirstChild(name) end
+    if not inst then inst = Workspace:FindFirstChild(name, true) end
+    if inst and inst:IsA("BasePart") and inst:IsDescendantOf(Workspace) then return inst end
+    return nil
+end
+
+function T3.stopAim()
+    T3.aimTarget = nil
+    T3.aimUp = false
+    if T3.aimBound then
+        T3.aimBound = false
+        pcall(function() RunService:UnbindFromRenderStep(T3_BIND) end)
+    end
+end
+
+function T3.bindAim()
+    if T3.aimBound then return end
+    T3.aimBound = true
+    RunService:BindToRenderStep(T3_BIND, Enum.RenderPriority.Camera.Value + 1, function()
+        local cam = Workspace.CurrentCamera
+        if not (Alive and State.Mentor and cam) then return end
+        local camPos = cam.CFrame.Position
+        if T3.aimUp then
+            cam.CFrame = CFrame.lookAt(camPos, camPos + (T3.aimDir or Vector3.yAxis), Vector3.zAxis)
+            return
+        end
+        local tg = T3.aimTarget
+        if not (tg and tg.Parent) then return end
+        if (tg.Position - camPos).Magnitude < 0.5 then return end
+        cam.CFrame = CFrame.lookAt(camPos, tg.Position)
+    end)
+end
+
+function T3.startAim(target)
+    T3.aimTarget = target
+    T3.bindAim()
+end
+
+function T3.startAimUp(dir)
+    T3.aimUp = true
+    T3.aimDir = dir or Vector3.yAxis
+    T3.bindAim()
+end
+
+-- Quest 5. Fly + noclip on, camera/character looking straight down (above the boss) or up (under it), Offset studs from the boss,
+-- press Q until the boss reads alive, then set its Humanoid.Health to 0 (same call the grind uses).
+function T3.findFightBoss(mentorName)
+    local t = Config.Mentor.Training5
+    local pools = {}
+    local folder = Workspace:FindFirstChild(t.BossFolder)
+    if folder then pools[#pools + 1] = folder:GetChildren() end
+    pools[#pools + 1] = Workspace:GetChildren()
+    local want = mentorName and mentorName:lower() or nil
+    for _, pool in ipairs(pools) do
+        local best, bestScore = nil, -1
+        for _, m in ipairs(pool) do
+            if m:IsA("Model") and not Players:GetPlayerFromCharacter(m) then
+                local hum = m:FindFirstChildOfClass("Humanoid")
+                local part = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart or m:FindFirstChild("Head")
+                if hum and part then
+                    local score = (hum.Health > 0) and 1 or 0
+                    if want and m.Name:lower():find(want, 1, true) then score += 2 end
+                    if score > bestScore then best, bestScore = { m, hum, part }, score end
+                end
+            end
+        end
+        if best then return best[1], best[2], best[3] end
+    end
+    return nil
+end
+
+-- Teleporting to another server destroys this script. queue_on_teleport re-runs the hub there and
+-- hands it a "resume training 5" flag. Needs a reload source: getgenv().EggzyHubReloadUrl (loadstring + HttpGet)
+-- or the hub saved as Training5.ReloadFile in the executor workspace.
+function T3.findReloadLoader()
+    if T3.loader ~= nil then return T3.loader or nil, T3.loaderNote end
+    local t = Config.Mentor.Training5
+    local okE, genv = pcall(getgenv)
+    local url = okE and genv and genv.EggzyHubReloadUrl
+    if type(url) == "string" and url ~= "" then
+        T3.loader, T3.loaderNote = string.format("loadstring(game:HttpGet(%q))()", url), "url"
+        return T3.loader, T3.loaderNote
+    end
+    -- Best source: the full hub text carried inside the file that launched it (EggzyHubSolo.lua).
+    local embedded = okE and genv and genv.EggzyHubSourceText
+    if type(embedded) == "string" and #embedded > 1000 then
+        local level = 0
+        while embedded:find("]" .. string.rep("=", level) .. "]", 1, true) do level += 1 end
+        local eq = string.rep("=", level)
+        T3.loader = "getgenv().EggzyHubSourceText = [" .. eq .. "[" .. embedded .. "]" .. eq .. "]\n"
+            .. "loadstring(getgenv().EggzyHubSourceText)()"
+        T3.loaderNote = "embedded hub source (" .. #embedded .. " bytes)"
+        return T3.loader, T3.loaderNote
+    end
+    local function viaFile(name)
+        return string.format("loadstring(readfile(%q))()", name)
+    end
+    if isfile and readfile then
+        local named = (okE and genv and genv.EggzyHubReloadFile) or t.ReloadFile
+        if type(named) == "string" and isfile(named) then
+            T3.loader, T3.loaderNote = viaFile(named), "file " .. named
+            return T3.loader, T3.loaderNote
+        end
+        -- search the executor workspace for a file that starts with the hub's header line
+        if listfiles then
+            local seen = 0
+            for _, root in ipairs({ "", "scripts", "Scripts", "autoexec" }) do
+                local okL, files = pcall(listfiles, root)
+                if okL and type(files) == "table" then
+                    for _, f in ipairs(files) do
+                        local lower = tostring(f):lower()
+                        if (lower:sub(-4) == ".lua" or lower:sub(-4) == ".txt") and seen < 300 then
+                            seen += 1
+                            local okR, text = pcall(readfile, f)
+                            if okR and type(text) == "string" and text:sub(1, 400):find("EggzyHub.lua (client-side Luau)", 1, true) then
+                                T3.loader, T3.loaderNote = viaFile(f), "file " .. tostring(f)
+                                return T3.loader, T3.loaderNote
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    T3.loader, T3.loaderNote = false, "no reload source found (save the hub as " .. t.ReloadFile .. " in the executor workspace, or set getgenv().EggzyHubReloadUrl)"
+    return nil, T3.loaderNote
+end
+
+function T3.markResume()
+    local t = Config.Mentor.Training5
+    local okE, genv = pcall(getgenv)
+    if okE and genv then genv.EggzyResume = "t5" end
+    -- time | PlaceId | JobId | mentor name: lets the new server prove it is a different server and know who to fight
+    local payload = table.concat({ tostring(os.time()), tostring(game.PlaceId), tostring(game.JobId), tostring(MentorInfo.name or "") }, "|")
+    if writefile then pcall(writefile, t.ResumeFile, payload) end
+end
+
+function T3.clearResume()
+    local t = Config.Mentor.Training5
+    local okE, genv = pcall(getgenv)
+    if okE and genv then genv.EggzyResume = nil end
+    if delfile and isfile and isfile(t.ResumeFile) then
+        pcall(delfile, t.ResumeFile)
+    elseif writefile then
+        pcall(writefile, t.ResumeFile, "0")
+    end
+end
+
+-- Reads and consumes the flag file. Returns fresh, info, why.
+-- fresh = written recently AND we are in a different server (JobId changed), i.e. we were teleported, not just re-executed.
+function T3.takeResumeFlag()
+    local t = Config.Mentor.Training5
+    local fresh, info, why = false, nil, "no flag file"
+    if isfile and readfile and isfile(t.ResumeFile) then
+        local okR, txt = pcall(readfile, t.ResumeFile)
+        if okR and type(txt) == "string" then
+            local ts, placeId, jobId, name = txt:match("^(%d+)|([^|]*)|([^|]*)|(.*)$")
+            if not ts then ts = txt:match("^(%d+)$") end
+            ts = tonumber(ts)
+            if ts and ts > 0 then
+                info = { ts = ts, placeId = placeId, jobId = jobId, name = (name and name ~= "") and name or nil }
+                if math.abs(os.time() - ts) > t.ResumeWindow then
+                    why = "flag is older than " .. t.ResumeWindow .. " s"
+                elseif jobId and jobId ~= "" and jobId == tostring(game.JobId) then
+                    why = "same server (JobId unchanged), not a teleport"
+                else
+                    fresh, why = true, string.format("teleported: JobId changed, place %s -> %s", tostring(placeId), tostring(game.PlaceId))
+                end
+            else
+                why = "flag file empty"
+            end
+        end
+    end
+    T3.clearResume()
+    return fresh, info, why
+end
+
+function T3.playerMentorName()
+    local ok, cands = pcall(mentorCandidates)
+    if not ok then return nil end
+    table.sort(cands, function(a, b) return (a.kw and 1 or 0) > (b.kw and 1 or 0) end)
+    for _, c in ipairs(cands) do
+        if c.kw and type(c.raw) == "string" and c.raw ~= "" then return c.raw end
+    end
+    return nil
+end
+
+-- Writes what the player's data and mission UI look like right now, so the "which quest am I on" source can be found.
+T3.snapLog = {}
+function T3.questSnapshot(tag)
+    local lines = { string.format("== %s | %s | place %s job %s", tostring(tag), os.date("%X"), tostring(game.PlaceId), tostring(game.JobId)) }
+    local statz = LocalPlayer:FindFirstChild("statz")
+    if statz then
+        for _, v in ipairs(statz:GetChildren()) do
+            if v:IsA("ValueBase") and #lines < 120 then lines[#lines + 1] = "statz." .. v.Name .. " = " .. tostring(v.Value) end
+        end
+    end
+    for k, v in pairs(LocalPlayer:GetAttributes()) do
+        if #lines < 160 then lines[#lines + 1] = "attr " .. tostring(k) .. " = " .. tostring(v) end
+    end
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        local n = 0
+        for _, d in ipairs(pg:GetDescendants()) do
+            if n >= 40 then break end
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible and d.Text ~= "" then
+                local l = d.Text:lower()
+                if l:find("training") or l:find("mission") or l:find("quest") or l:find("mentor") or l:find("sensei") then
+                    n += 1
+                    lines[#lines + 1] = "gui " .. d:GetFullName() .. ": " .. d.Text:sub(1, 90)
+                end
+            end
+        end
+    end
+    T3.snapLog[#T3.snapLog + 1] = table.concat(lines, "\n")
+    if writefile then pcall(writefile, Config.Mentor.QuestSnapshotFile, table.concat(T3.snapLog, "\n\n")) end
+    if Config.Debug then print("[EggzyMentor] quest snapshot saved: " .. tostring(tag)) end
+end
+
+-- Progress: which training the chain is on, kept in ProgressFile so leaving and rejoining continues where you were.
+-- A training that was interrupted restarts from its beginning (the count inside it is not saved).
+function T3.loadProgress()
+    local m = Config.Mentor
+    T3.progress, T3.progressName = m.StartMission, nil
+    if isfile and readfile and isfile(m.ProgressFile) then
+        local okR, txt = pcall(readfile, m.ProgressFile)
+        if okR and type(txt) == "string" then
+            local mission, name = txt:match("^(%d+)|([^|]*)")
+            mission = tonumber(mission)
+            if mission and mission >= 1 and mission <= 6 then
+                T3.progress = mission
+                T3.progressName = (name and name ~= "") and name or nil
+            end
+        end
+    end
+    m.Mission = T3.progress
+end
+
+function T3.saveProgress()
+    if writefile then
+        pcall(writefile, Config.Mentor.ProgressFile, tostring(T3.progress) .. "|" .. (T3.progressName or "") .. "|" .. tostring(os.time()))
+    end
+end
+
+T3.loadProgress()
+print(string.format("[EggzyMentor] progress file: training %d%s", T3.progress, T3.progressName and (" (mentor " .. T3.progressName .. ")") or " (no saved mentor)"))
+
+function T3.queueReload()
+    if T3.queued then return true, "already queued" end
+    local okG, genvL = pcall(getgenv)
+    if okG and genvL and genvL.EggzyLoaderActive then
+        return true, "EggzyLoader is armed (hub does not queue a second copy)"
+    end
+    local q = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+    if not q then return false, "executor has no queue_on_teleport" end
+    local loader, note = T3.findReloadLoader()
+    if not loader then return false, note end
+    -- The queued script proves it ran (EggzyQueueRan.txt + a line in EggzyHub_log.txt), logs a launch failure instead of
+    -- dying silently, and runs once per server (re-arming below can queue it several times).
+    local code = table.concat({
+        'local function logLine(msg)',
+        '  pcall(function()',
+        '    if not writefile then return end',
+        '    local old = (isfile and isfile("EggzyHub_log.txt") and readfile("EggzyHub_log.txt")) or ""',
+        '    writefile("EggzyHub_log.txt", old .. "\\n" .. os.date("%X") .. " [queued payload] " .. msg)',
+        '  end)',
+        'end',
+        'if getgenv().EggzyPayloadJob == game.JobId then return end',
+        'getgenv().EggzyPayloadJob = game.JobId',
+        'pcall(function() if writefile then writefile("EggzyQueueRan.txt", os.date() .. " place " .. game.PlaceId .. " job " .. game.JobId) end end)',
+        'logLine("ran in place " .. game.PlaceId .. " job " .. game.JobId)',
+        'repeat task.wait() until game:IsLoaded() and game:GetService("Players").LocalPlayer',
+        'getgenv().EggzyResume = "t5"',
+        'local ok, err = pcall(function()',
+        loader,
+        'end)',
+        'logLine(ok and "hub launched" or ("hub launch failed: " .. tostring(err)))',
+    }, "\n")
+    local okQ, err = pcall(q, code)
+    if not okQ then return false, tostring(err) end
+    T3.queued = true
+    T3.queuePayload = code
+    -- Some executors keep only the LAST queued script (your auto-relog script re-arms for that reason), and other scripts
+    -- may queue their own: re-queue every 10 s while we wait for the teleport.
+    task.spawn(function()
+        local untilT = os.clock() + Config.Mentor.Training5.TeleportWait + 10
+        while Alive and os.clock() < untilT do
+            task.wait(10)
+            pcall(q, code)
+        end
+    end)
+    return true, "queued via " .. note
+end
+
+function T3.fight()
+    local t, g = Config.Mentor.Training5, Config.Grind
+    local function stillOn() return Alive and State.Mentor and not State.Grind end
+    local mentorName = T3.resumeName or MentorInfo.name or T3.playerMentorName()
+    local announced = false
+    T3.questSnapshot("fight server start (mentor " .. tostring(mentorName) .. ")")
+
+    State.Fly = true
+    State.Noclip = true
+    State.Kill = true
+    startFly()
+    T3.startAimUp(t.Offset >= 0 and -Vector3.yAxis or Vector3.yAxis) -- straight down when above the boss, straight up when under it
+
+    local ok, result = pcall(function()
+        local deadline = os.clock() + t.BossTimeout
+        local aliveSince, lastQ, sawBoss = nil, 0, false
+        while stillOn() and os.clock() < deadline do
+            -- fly, noclip and Instant Kill must stay on the whole fight: re-assert every loop
+            State.Fly = true
+            State.Noclip = true
+            State.Kill = true -- Instant Kill toggle (hits models in Workspace.npc within Config.Kill.Range)
+            if not (flyBV and flyBV.Parent) then startFly() end
+
+            local model, hum, part = T3.findFightBoss(mentorName)
+            if model then
+                sawBoss = true
+                if not announced then
+                    announced = true
+                    local match = mentorName and model.Name:lower():find(mentorName:lower(), 1, true) ~= nil
+                    print(string.format("[EggzyMentor] fight check: boss candidate %s | mentor %s | name match %s | mentor folder here: %s",
+                        model.Name, tostring(mentorName), tostring(match), tostring(mentorMissionsFolder() ~= nil)))
+                end
+                -- dead = gone from the world, or died by itself (a Health 0 that WE wrote does not count)
+                if not model.Parent or (hum.Health <= 0 and not scriptZeroed[hum]) then
+                    return string.format("boss %s is dead", model.Name)
+                end
+                MentorInfo.phase = string.format("t5 %s %s (hp %.0f)", t.Offset >= 0 and "above" or "under", model.Name, hum.Health)
+                placeUnder(part, t.Offset)
+                if isLiving(hum) then
+                    aliveSince = aliveSince or os.clock()
+                    -- from you: press Q every 5 seconds while the boss is alive
+                    if os.clock() - lastQ >= t.QPeriod then
+                        lastQ = os.clock()
+                        pressKey(g.Key, g.KeyHold)
+                    end
+                    if os.clock() - aliveSince >= t.AliveConfirm and hum.Health > 0 then
+                        scriptZeroed[hum] = true
+                        pcall(function() hum.Health = 0 end)
+                    end
+                else
+                    aliveSince = nil
+                end
+            else
+                if sawBoss then return "boss model is gone" end
+                aliveSince = nil
+                MentorInfo.phase = "t5 waiting for boss"
+                -- boss not there yet: keep pressing Q until it shows up
+                pressKey(g.Key, g.KeyHold)
+                task.wait(g.KeyDelay)
+            end
+            task.wait(g.KillStep)
+        end
+        return "boss still alive at timeout, or stopped"
+    end)
+
+    T3.stopAim()
+    -- Flight, noclip and Instant Kill are left ON after the fight (you said they must be on); turn them off in the Player page.
+    return ok, tostring(result)
+end
+
+-- Returns true when a throw hit (target gone / replaced / moved), false otherwise, plus a reason.
+function T3.round(lookOnly)
+    local t = Config.Mentor.Training3
+    local function stillOn() return Alive and State.Mentor and not State.Grind end
+
+    MentorInfo.phase = "t3 looking for target"
+    local target
+    local deadline = os.clock() + t.FindTimeout
+    while stillOn() and os.clock() < deadline do
+        target = T3.findTarget()
+        if target then break end
+        task.wait(t.Poll)
+    end
+    if not target then return false, "no target found" end
+
+    T3.startAim(target)
+    local ok, hit, reason = pcall(function()
+        task.wait(t.AimSettle)
+        local basePos = target.Position
+        if lookOnly then
+            MentorInfo.phase = "t4 looking"
+            local untilL = os.clock() + Config.Mentor.Training4.LookTimeout
+            while stillOn() and os.clock() < untilL do
+                local cur = T3.findTarget()
+                if cur ~= target then
+                    return true, cur and "replaced by a new instance" or "target removed"
+                end
+                local moved = (cur.Position - basePos).Magnitude
+                if moved > t.MoveThreshold then
+                    return true, string.format("target moved %.1f studs", moved)
+                end
+                task.wait(t.Poll)
+            end
+            return false, "target did not change while looking"
+        end
+        for throw = 1, t.MaxThrows do
+            if not stillOn() then return false, "stopped" end
+            MentorInfo.phase = string.format("t3 throw %d", throw)
+            local cam = Workspace.CurrentCamera
+            if okVim and VIM and cam then
+                local vp = cam.ViewportSize
+                pcall(function() VIM:SendMouseMoveEvent(vp.X / 2, vp.Y / 2, game) end)
+            end
+            local ready = T3.lastThrowAt + t.ThrowCooldown
+            while stillOn() and os.clock() < ready do
+                task.wait(0.05)
+            end
+            if not stillOn() then return false, "stopped" end
+            T3.lastThrowAt = os.clock()
+            clickM1(t.M1Hold)
+            local untilT = os.clock() + t.HitWait
+            while stillOn() and os.clock() < untilT do
+                local cur = T3.findTarget()
+                if cur ~= target then
+                    return true, cur and "replaced by a new instance" or "target removed"
+                end
+                local moved = (cur.Position - basePos).Magnitude
+                if moved > t.MoveThreshold then
+                    return true, string.format("target moved %.1f studs", moved)
+                end
+                task.wait(t.Poll)
+            end
+        end
+        return false, "no hit after " .. t.MaxThrows .. " throws"
+    end)
+    T3.stopAim()
+    if not ok then return false, tostring(hit) end
+    return hit, reason
+end
+
+do
+    local okE, genv = pcall(getgenv)
+    local byGenv = okE and genv and genv.EggzyResume == "t5" -- read before takeResumeFlag clears it
+    local byFlag, flagInfo, flagWhy = T3.takeResumeFlag()
+    if Config.Debug and (byFlag or byGenv or flagInfo) then
+        print(string.format("[EggzyMentor] resume check: flag=%s (%s) | queued flag=%s", tostring(byFlag), tostring(flagWhy), tostring(byGenv)))
+    end
+    if byFlag or (byGenv and not (flagInfo and not byFlag)) then
+        if okE and genv then genv.EggzyResume = nil end
+        T3.resumeName = flagInfo and flagInfo.name or nil
+        Config.Mentor.Mission = 5
+        State.Mentor = true
+        T3.resume = true
+        print("[EggzyMentor] resumed after server teleport: training 5 (mentor fight)")
+    end
+end
+
+task.spawn(function()
+    local phase, presses, nextAt = T3.resume and "t5" or "talk", 0, 0
+    local t2Fails = 0
+    while Alive do
+        local m = Config.Mentor
+        if State.Mentor and m.Mission ~= T3.progress then
+            T3.progress = m.Mission
+            T3.saveProgress()
+        end
+        if not State.Mentor then
+            if phase ~= "talk" or presses ~= 0 then
+                phase, presses = "talk", 0
+                forceReleaseInputs()
+            end
+            nextAt = 0
+            MentorInfo.phase = "off"
+            -- switched off: the chain continues from the saved progress next time (in the fight server it stays on 5)
+            m.Mission = (mentorMissionsFolder() == nil) and 5 or T3.progress
+        elseif State.Grind then
+            MentorInfo.phase = "paused (grind)"
+        elseif os.clock() >= nextAt then
+            pcall(function()
+                if m.Mission >= 6 then
+                    local okN, nm = pcall(detectMentorName)
+                    if okN and nm and T3.progressName and T3.progressName ~= "" and nm ~= T3.progressName then
+                        print("[EggzyMentor] different mentor than the saved progress (" .. T3.progressName .. " -> " .. nm .. "): chain restarts at training " .. m.StartMission)
+                        m.Mission = m.StartMission
+                        T3.progressName = nm
+                    else
+                        MentorInfo.phase = "all 5 trainings done (delete " .. m.ProgressFile .. " to restart)"
+                        nextAt = os.clock() + 2
+                        return
+                    end
+                end
+                if phase == "talk" and m.Mission == 5 and mentorMissionsFolder() == nil then phase = "t5" end
+                if phase == "talk" then
+                    local name, source = detectMentorName()
+                    if Config.Debug and (name ~= MentorInfo.name or source ~= MentorInfo.source) then
+                        print("[EggzyMentor] mentor:", name, "|", source)
+                    end
+                    MentorInfo.name, MentorInfo.source = name, source
+                    if name and T3.progressName and T3.progressName ~= "" and name ~= T3.progressName and m.Mission == T3.progress and m.Mission ~= m.StartMission then
+                        print("[EggzyMentor] different mentor than the saved progress (" .. T3.progressName .. " -> " .. name .. "): chain restarts at training " .. m.StartMission)
+                        m.Mission = m.StartMission
+                    end
+                    if name and name ~= T3.progressName then
+                        T3.progressName = name
+                        T3.saveProgress()
+                    end
+                    local remote = name and mentorRemoteFor(name)
+                    local reloadNote = nil
+                    if remote and m.Mission == 5 then
+                        T3.markResume()
+                        local okQ, whyQ = T3.queueReload()
+                        if Config.Debug and whyQ ~= "already queued" then
+                            print("[EggzyMentor] reload for the fight server:", okQ, whyQ)
+                        end
+                        if not okQ then reloadNote = whyQ end
+                    end
+                    if remote then
+                        stopFaceLock()
+                        local ok = pcall(function() remote:FireServer(LocalPlayer) end)
+                        if ok then
+                            local tagMission = m.Mission
+                            task.delay(2, function() pcall(T3.questSnapshot, "2 s after talking, hub training " .. tagMission) end)
+                            phase, presses = (m.Mission == 2 and "t2") or ((m.Mission == 3 or m.Mission == 4) and "t3") or (m.Mission == 5 and "t5wait") or "m1", 0
+                            nextAt = os.clock() + ((m.Mission == 5) and m.Training5.TeleportWait or m.StartDelay)
+                            MentorInfo.phase = (m.Mission == 5) and ("t5 waiting for server teleport" .. (reloadNote and (" (NO RELOAD: " .. reloadNote .. ")") or "")) or string.format("starting in ~%ds", m.StartDelay)
+                            return
+                        end
+                    end
+                    MentorInfo.phase = remote and "talk failed" or ("no remote: " .. tostring(source))
+                    nextAt = os.clock() + m.Interval
+                elseif phase == "t5wait" then
+                    T3.clearResume()
+                    phase = "talk"
+                    nextAt = os.clock() + m.Interval
+                elseif phase == "t5" then
+                    local okFight, summary = T3.fight()
+                    if Config.Debug then
+                        print("[EggzyMentor] t5:", tostring(okFight), summary)
+                    end
+                    MentorInfo.phase = "t5 done: " .. summary
+                    if okFight and (summary:find("is dead", 1, true) or summary:find("is gone", 1, true)) then
+                        m.Mission = 6 -- all five trainings done; saved by the loop above
+                    end
+                    phase, presses = "t5done", 0
+                elseif phase == "t5done" then
+                    nextAt = os.clock() + 1
+                elseif phase == "t2" then
+                    local t = m.Training2
+                    MentorInfo.phase = string.format("t2 rep %d/%d", presses + 1, t.Repeats)
+                    local okRun, arrived = pcall(runTraining2)
+                    if okRun and arrived then
+                        presses += 1
+                        t2Fails = 0
+                    else
+                        t2Fails += 1
+                    end
+                    if presses >= t.Repeats then
+                        MentorInfo.phase = "t2 done"
+                        m.Mission = 3
+                        phase, presses, t2Fails = "talk", 0, 0
+                        nextAt = os.clock() + m.Interval
+                    elseif t2Fails >= t.MaxFails then
+                        MentorInfo.phase = "t2 failed (returned)"
+                        phase, presses, t2Fails = "talk", 0, 0
+                        nextAt = os.clock() + m.Interval
+                    else
+                        nextAt = os.clock() + t.RepGap
+                    end
+                elseif phase == "t3" then
+                    local lookOnly = (m.Mission == 4)
+                    local t = lookOnly and m.Training4 or m.Training3
+                    local hit, why = T3.round(lookOnly)
+                    if Config.Debug then
+                        print(string.format("[EggzyMentor] t3/t4 round %d: done=%s (%s)", presses + 1, tostring(hit), tostring(why)))
+                    end
+                    if hit then
+                        presses += 1
+                        t2Fails = 0
+                    else
+                        t2Fails += 1
+                    end
+                    MentorInfo.phase = string.format("%s targets %d/%d", lookOnly and "t4" or "t3", presses, t.Repeats)
+                    if presses >= t.Repeats then
+                        MentorInfo.phase = lookOnly and "t4 done" or "t3 done"
+                        m.Mission = lookOnly and 5 or 4
+                        phase, presses, t2Fails = "talk", 0, 0
+                        nextAt = os.clock() + m.Interval
+                    elseif t2Fails >= t.MaxFails then
+                        MentorInfo.phase = "t3 failed (" .. tostring(why) .. ")"
+                        phase, presses, t2Fails = "talk", 0, 0
+                        nextAt = os.clock() + m.Interval
+                    else
+                        nextAt = os.clock() + t.RoundGap
+                    end
+                else
+                    local root, hum = getRoot()
+                    if not (root and hum and hum.Health > 0)
+                        or not windowFocused
+                        or UserInputService:GetFocusedTextBox() then
+                        nextAt = os.clock() + 0.5
+                        return
+                    end
+                    if clickM1(m.M1Hold) then
+                        presses += 1
+                    end
+                    MentorInfo.phase = string.format("M1 %d/%d", presses, m.M1Count)
+                    if presses >= m.M1Count then
+                        m.Mission = 2
+                        phase, presses = "talk", 0
+                        nextAt = os.clock() + m.Interval
+                    else
+                        nextAt = os.clock() + m.M1Period
+                    end
+                end
             end)
         end
-    end
-    list.CanvasPosition = Vector2.new(0, 1e6)
-end
-
-local dirty = false
-onLogChanged = function() dirty = true end
-
-local drainConn = RunService.Heartbeat:Connect(function()
-    local taken = 0
-    while #Queue > 0 and taken < 60 do
-        local item = table.remove(Queue, 1)
-        taken += 1
-        pcall(handleCall, item[1], item[2], item[3], item[4])
-    end
-    if dirty then
-        dirty = false
-        local okR, err = pcall(rebuild)
-        if not okR then warn("[WrenchSpy] window update failed: " .. tostring(err)) end
+        task.wait(0.1)
     end
 end)
 
-local function allText(filtered)
-    local out = {}
-    for _, entry in ipairs(Lines) do
-        if not filtered or lineMatches(entry) then
-            out[#out + 1] = entry.text .. "\n" .. entry.call
+-- ===================== SCROLL STEALER =====================
+-- Runs only while Money Grind AND Scroll Stealer are on. When a scroll model exists that you do not own:
+-- remember where you stand, hover Config.Scroll.ClickHeight studs above it looking straight down,
+-- click M1 Config.Scroll.Clicks times, then put you back where you were (under the boss if the grind was
+-- fighting one, otherwise the exact spot you left). Which models count as scrolls is inferred from the ESP
+-- code: models in Workspace.npc or Workspace.GLOBALTIME that isScrollModel accepts, plus Workspace children
+-- named like a scroll. That is not confirmed against a real drop yet.
+local SC = { attempts = setmetatable({}, { __mode = "k" }), bound = false, aimPos = nil, camHeight = 10 }
+local SC_BIND = "EggzyScrollAim"
+
+function SC.candidates()
+    local list, seen = {}, {}
+    local function add(m, full)
+        if seen[m] or not m:IsA("Model") or m:FindFirstChildOfClass("Humanoid") then return end
+        local name = m.Name:lower()
+        local ok
+        if full then
+            ok = isScrollModel(m)
+        else
+            ok = (name:find("scroll", 1, true) ~= nil and not name:find("mission", 1, true) and not m:FindFirstChild("missiongiver"))
+                or name:sub(1, #SCROLL_PREFIX) == SCROLL_PREFIX and not name:find("mission", 1, true)
+        end
+        if ok then
+            seen[m] = true
+            list[#list + 1] = m
         end
     end
-    return table.concat(out, "\n\n")
+    local npc = Workspace:FindFirstChild("npc")
+    if npc then for _, m in ipairs(npc:GetChildren()) do add(m, true) end end
+    local gt = Workspace:FindFirstChild("GLOBALTIME")
+    if gt then for _, m in ipairs(gt:GetChildren()) do add(m, true) end end
+    for _, m in ipairs(Workspace:GetChildren()) do add(m, false) end
+    return list
 end
 
-filterBox:GetPropertyChangedSignal("Text"):Connect(function()
-    Filter = filterBox.Text
-    rebuild()
-end)
+function SC.unbindAim()
+    SC.aimPos = nil
+    if SC.bound then
+        SC.bound = false
+        pcall(function() RunService:UnbindFromRenderStep(SC_BIND) end)
+    end
+end
 
-pauseBtn.MouseButton1Click:Connect(function()
-    Paused = not Paused
-    pauseBtn.Text = Paused and "Resume" or "Pause"
-end)
-clearBtn.MouseButton1Click:Connect(function()
-    table.clear(Lines)
-    table.clear(FullLog)
-    rebuild()
-end)
-copyBtn.MouseButton1Click:Connect(function()
-    if setclipboard then pcall(setclipboard, allText(true)) end
-end)
-copyLastBtn.MouseButton1Click:Connect(function()
-    local last = Lines[#Lines]
-    if last and setclipboard then pcall(setclipboard, last.text .. "\n" .. last.call) end
-end)
-saveBtn.MouseButton1Click:Connect(function()
-    if writefile then
-        pcall(writefile, Config.OutFile, table.concat(FullLog, "\n\n"))
-        print("[WrenchSpy] saved " .. #FullLog .. " calls to " .. Config.OutFile)
+function SC.bindAim()
+    if SC.bound then return end
+    SC.bound = true
+    RunService:BindToRenderStep(SC_BIND, Enum.RenderPriority.Camera.Value + 1, function()
+        local cam = Workspace.CurrentCamera
+        if not (cam and SC.aimPos) then return end
+        cam.CFrame = CFrame.lookAt(SC.aimPos + Vector3.new(0, SC.camHeight, 0), SC.aimPos, Vector3.zAxis)
+    end)
+end
+
+-- Returns true when the trip ran (clicks were sent); you are always put back afterwards.
+function SC.trip(model)
+    local cfg = Config.Scroll
+    local part = Config.ESP.ScrollESP.Adornee(model)
+    if not (part and part:IsA("BasePart") and part:IsDescendantOf(Workspace)) then return false end
+    local pos = part.Position
+    if pos ~= pos or pos.Y < cfg.MinY or pos.Y > cfg.MaxY then return false end
+    local root = getRoot()
+    if not root then return false end
+    local saved = root.CFrame
+
+    State.ScrollTrip = true
+    local ok, err = pcall(function()
+        local hoverCF = CFrame.lookAt(pos + Vector3.new(0, cfg.ClickHeight, 0), pos, Vector3.zAxis)
+        SC.camHeight = cfg.ClickHeight + 4
+        SC.aimPos = pos
+        SC.bindAim()
+        local function hold()
+            local r = getRoot()
+            if r then
+                r.CFrame = hoverCF
+                r.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+        local function holdFor(seconds)
+            local untilT = os.clock() + seconds
+            repeat
+                hold()
+                task.wait(0.05)
+            until os.clock() >= untilT or not Alive
+        end
+        holdFor(cfg.Settle)
+        for i = 1, cfg.Clicks do
+            if not (Alive and State.Scrolls and State.Grind) then break end
+            hold()
+            local cam = Workspace.CurrentCamera
+            if okVim and VIM and cam then
+                local vp = cam.ViewportSize
+                pcall(function() VIM:SendMouseMoveEvent(vp.X / 2, vp.Y / 2, game) end)
+            end
+            local sent = false
+            for _ = 1, 10 do
+                if clickM1(cfg.ClickHold) then sent = true break end
+                task.wait(0.05)
+            end
+            if Config.Debug then
+                print(string.format("[EggzyScroll] click %d/%d on %s sent=%s", i, cfg.Clicks, model.Name, tostring(sent)))
+            end
+            holdFor(cfg.ClickGap)
+        end
+    end)
+    SC.unbindAim()
+    local r = getRoot()
+    if r then
+        r.CFrame = saved
+        r.AssemblyLinearVelocity = Vector3.zero
+    end
+    State.ScrollTrip = false
+    if not ok and Config.Debug then
+        print("[EggzyScroll] trip error:", err)
+    end
+    return ok
+end
+
+task.spawn(function()
+    while Alive do
+        task.wait(Config.Scroll.Scan)
+        if State.Scrolls and State.Grind and not State.ScrollTrip then
+            local root, hum = getRoot()
+            if root and hum and hum.Health > 0 then
+                local ok, list = pcall(SC.candidates)
+                if ok then
+                    for _, m in ipairs(list) do
+                        local tries = SC.attempts[m] or 0
+                        if tries < Config.Scroll.MaxAttempts and m.Parent and not Config.Scroll.OwnsScroll(m) then
+                            SC.attempts[m] = tries + 1
+                            if Config.Debug then
+                                print(string.format("[EggzyScroll] scroll %s (attempt %d/%d)", m.Name, tries + 1, Config.Scroll.MaxAttempts))
+                            end
+                            pcall(SC.trip, m)
+                            task.wait(Config.Scroll.AttemptDelay)
+                            break
+                        end
+                    end
+                end
+            end
+        end
     end
 end)
-unmuteBtn.MouseButton1Click:Connect(function()
-    table.clear(Muted)
-    table.clear(Counters)
-end)
 
-local keyConn = UserInputService.InputBegan:Connect(function(input, processed)
-    if processed then return end
-    if input.KeyCode == Enum.KeyCode.F8 then
-        win.Visible = not win.Visible
+-- ===================== GUI SETUP =====================
+local gui = Instance.new("ScreenGui")
+gui.Name = "EggzyHub"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = guiParent()
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(720, 480)
+main.Position = UDim2.fromOffset(80, 80)
+main.BackgroundColor3 = Theme.Background
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Theme.Border
+mainStroke.Thickness = 1
+mainStroke.Transparency = 0.3
+mainStroke.Parent = main
+
+local sidebar = Instance.new("Frame")
+sidebar.Name = "Sidebar"
+sidebar.Size = UDim2.new(0, 180, 1, 0)
+sidebar.BackgroundColor3 = Theme.Sidebar
+sidebar.BorderSizePixel = 0
+sidebar.Parent = main
+
+local sideStroke = Instance.new("UIStroke")
+sideStroke.Color = Theme.BorderSoft
+sideStroke.Thickness = 1
+sideStroke.Transparency = 0.5
+sideStroke.Parent = sidebar
+
+local logoFrame = Instance.new("Frame")
+logoFrame.Size = UDim2.new(1, 0, 0, 56)
+logoFrame.BackgroundTransparency = 1
+logoFrame.Parent = sidebar
+
+local logoEgg = Instance.new("TextLabel")
+logoEgg.Size = UDim2.fromOffset(32, 32)
+logoEgg.Position = UDim2.fromOffset(12, 12)
+logoEgg.BackgroundTransparency = 1
+logoEgg.Text = "🥚"
+logoEgg.TextSize = 24
+logoEgg.Font = Enum.Font.GothamBold
+logoEgg.TextXAlignment = Enum.TextXAlignment.Center
+logoEgg.Parent = logoFrame
+
+local logoTitle = Instance.new("TextLabel")
+logoTitle.Size = UDim2.new(1, -52, 0, 22)
+logoTitle.Position = UDim2.fromOffset(48, 10)
+logoTitle.BackgroundTransparency = 1
+logoTitle.Text = "EGGZY"
+logoTitle.TextColor3 = Theme.Text
+logoTitle.Font = Enum.Font.GothamBold
+logoTitle.TextSize = 16
+logoTitle.TextXAlignment = Enum.TextXAlignment.Left
+logoTitle.Parent = logoFrame
+
+local logoSub = Instance.new("TextLabel")
+logoSub.Size = UDim2.new(1, -52, 0, 14)
+logoSub.Position = UDim2.fromOffset(48, 30)
+logoSub.BackgroundTransparency = 1
+logoSub.Text = "HUB"
+logoSub.TextColor3 = Theme.Accent
+logoSub.Font = Enum.Font.GothamMedium
+logoSub.TextSize = 11
+logoSub.TextXAlignment = Enum.TextXAlignment.Left
+logoSub.Parent = logoFrame
+
+local navContainer = Instance.new("ScrollingFrame")
+navContainer.Name = "Nav"
+navContainer.Position = UDim2.fromOffset(0, 60)
+navContainer.Size = UDim2.new(1, 0, 1, -70)
+navContainer.BackgroundTransparency = 1
+navContainer.BorderSizePixel = 0
+navContainer.ScrollBarThickness = 2
+navContainer.ScrollBarImageColor3 = Theme.Accent
+navContainer.CanvasSize = UDim2.new()
+navContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
+navContainer.Parent = sidebar
+
+local navLayout = Instance.new("UIListLayout", navContainer)
+navLayout.Padding = UDim.new(0, 2)
+navLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local navPad = Instance.new("UIPadding", navContainer)
+navPad.PaddingTop = UDim.new(0, 4)
+navPad.PaddingLeft = UDim.new(0, 8)
+navPad.PaddingRight = UDim.new(0, 8)
+navPad.PaddingBottom = UDim.new(0, 8)
+
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Position = UDim2.fromOffset(180, 0)
+content.Size = UDim2.new(1, -180, 1, 0)
+content.BackgroundColor3 = Theme.Background
+content.BorderSizePixel = 0
+content.Parent = main
+
+local topBar = Instance.new("Frame")
+topBar.Name = "TopBar"
+topBar.Size = UDim2.new(1, 0, 0, 48)
+topBar.BackgroundColor3 = Theme.Sidebar
+topBar.BorderSizePixel = 0
+topBar.Parent = content
+
+local topStroke = Instance.new("UIStroke")
+topStroke.Color = Theme.BorderSoft
+topStroke.Thickness = 1
+topStroke.Transparency = 0.5
+topStroke.Parent = topBar
+
+local pageTitle = Instance.new("TextLabel")
+pageTitle.Name = "PageTitle"
+pageTitle.Size = UDim2.new(0.6, 0, 1, 0)
+pageTitle.Position = UDim2.fromOffset(18, 0)
+pageTitle.BackgroundTransparency = 1
+pageTitle.Text = "Home"
+pageTitle.TextColor3 = Theme.Text
+pageTitle.Font = Enum.Font.GothamBold
+pageTitle.TextSize = 15
+pageTitle.TextXAlignment = Enum.TextXAlignment.Left
+pageTitle.Parent = topBar
+
+local hideHint = Instance.new("TextLabel")
+hideHint.Size = UDim2.fromOffset(140, 48)
+hideHint.Position = UDim2.new(1, -180, 0, 0)
+hideHint.BackgroundTransparency = 1
+hideHint.Text = "RShift/Insert hide"
+hideHint.TextColor3 = Theme.TextMuted
+hideHint.Font = Enum.Font.Gotham
+hideHint.TextSize = 11
+hideHint.TextXAlignment = Enum.TextXAlignment.Right
+hideHint.Parent = topBar
+
+local pageContainer = Instance.new("Frame")
+pageContainer.Name = "Pages"
+pageContainer.Position = UDim2.fromOffset(0, 48)
+pageContainer.Size = UDim2.new(1, 0, 1, -48)
+pageContainer.BackgroundTransparency = 1
+pageContainer.ClipsDescendants = true
+pageContainer.Parent = content
+
+local pages = {}
+local currentPage = nil
+local navButtons = {}
+local refreshBossList = function() end
+
+local function setPage(name)
+    if currentPage == name then return end
+    for id, page in pairs(pages) do
+        page.Visible = (id == name)
     end
-end)
+    for id, btn in pairs(navButtons) do
+        local selected = (id == name)
+        btn.BackgroundColor3 = selected and Theme.Selected or Theme.Sidebar
+        btn.TextColor3 = selected and Theme.Text or Theme.TextDim
+        local accent = btn:FindFirstChild("Accent")
+        if accent then accent.Visible = selected end
+    end
+    pageTitle.Text = name
+    currentPage = name
+end
 
--- ---------------------------------------------------------------- stop (the metamethod hook cannot be safely removed; it just passes through once Alive is false)
-local function stop()
+local function createPage(name)
+    local page = Instance.new("ScrollingFrame")
+    page.Name = name
+    page.Size = UDim2.fromScale(1, 1)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 3
+    page.ScrollBarImageColor3 = Theme.Accent
+    page.CanvasSize = UDim2.new()
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.Visible = false
+    page.Parent = pageContainer
+
+    local pad = Instance.new("UIPadding", page)
+    pad.PaddingTop = UDim.new(0, 14)
+    pad.PaddingBottom = UDim.new(0, 16)
+    pad.PaddingLeft = UDim.new(0, 16)
+    pad.PaddingRight = UDim.new(0, 16)
+
+    local layout = Instance.new("UIListLayout", page)
+    layout.Padding = UDim.new(0, 10)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    pages[name] = page
+    return page
+end
+
+local function createNavButton(name, order, icon)
+    local btn = Instance.new("TextButton")
+    btn.Name = name
+    btn.Size = UDim2.new(1, 0, 0, 34)
+    btn.BackgroundColor3 = Theme.Sidebar
+    btn.BackgroundTransparency = 0
+    btn.Text = "  " .. (icon or "•") .. "   " .. name
+    btn.TextColor3 = Theme.TextDim
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 13
+    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.AutoButtonColor = false
+    btn.BorderSizePixel = 0
+    btn.LayoutOrder = order
+    btn.Parent = navContainer
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
+
+    local accent = Instance.new("Frame")
+    accent.Name = "Accent"
+    accent.Size = UDim2.fromOffset(3, 16)
+    accent.Position = UDim2.fromOffset(0, 9)
+    accent.BackgroundColor3 = Theme.Accent
+    accent.BorderSizePixel = 0
+    accent.Visible = false
+    accent.Parent = btn
+    Instance.new("UICorner", accent).CornerRadius = UDim.new(0, 2)
+
+    btn.MouseEnter:Connect(function()
+        if currentPage ~= name then
+            btn.BackgroundColor3 = Theme.SurfaceHover
+        end
+    end)
+    btn.MouseLeave:Connect(function()
+        if currentPage ~= name then
+            btn.BackgroundColor3 = Theme.Sidebar
+        end
+    end)
+    btn.MouseButton1Click:Connect(function()
+        setPage(name)
+    end)
+
+    navButtons[name] = btn
+    return btn
+end
+
+local function createCard(parent, title, order)
+    local card = Instance.new("Frame")
+    card.Name = title
+    card.Size = UDim2.new(1, 0, 0, 0)
+    card.AutomaticSize = Enum.AutomaticSize.Y
+    card.BackgroundColor3 = Theme.Card
+    card.BorderSizePixel = 0
+    card.LayoutOrder = order or 0
+    card.Parent = parent
+    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 9)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Theme.Border
+    stroke.Thickness = 1
+    stroke.Transparency = 0.45
+    stroke.Parent = card
+
+    local header = Instance.new("Frame")
+    header.Name = "Header"
+    header.Size = UDim2.new(1, 0, 0, 34)
+    header.BackgroundTransparency = 1
+    header.Parent = card
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -24, 1, 0)
+    titleLabel.Position = UDim2.fromOffset(14, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = title
+    titleLabel.TextColor3 = Theme.Text
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 13
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = header
+
+    local body = Instance.new("Frame")
+    body.Name = "Body"
+    body.Position = UDim2.fromOffset(0, 34)
+    body.Size = UDim2.new(1, 0, 0, 0)
+    body.AutomaticSize = Enum.AutomaticSize.Y
+    body.BackgroundTransparency = 1
+    body.Parent = card
+
+    local bodyPad = Instance.new("UIPadding", body)
+    bodyPad.PaddingTop = UDim.new(0, 2)
+    bodyPad.PaddingBottom = UDim.new(0, 12)
+    bodyPad.PaddingLeft = UDim.new(0, 12)
+    bodyPad.PaddingRight = UDim.new(0, 12)
+
+    local bodyLayout = Instance.new("UIListLayout", body)
+    bodyLayout.Padding = UDim.new(0, 6)
+    bodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    return card, body
+end
+
+local function createToggle(parent, label, order, getState, setState, gated)
+    local row = Instance.new("TextButton")
+    row.Name = label
+    row.Size = UDim2.new(1, 0, 0, 36)
+    row.BackgroundColor3 = Theme.Surface
+    row.BackgroundTransparency = 0.15
+    row.Text = ""
+    row.AutoButtonColor = false
+    row.BorderSizePixel = 0
+    row.LayoutOrder = order or 0
+    row.Parent = parent
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 7)
+
+    local rowStroke = Instance.new("UIStroke")
+    rowStroke.Color = Theme.BorderSoft
+    rowStroke.Thickness = 1
+    rowStroke.Transparency = 0.6
+    rowStroke.Parent = row
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, -80, 1, 0)
+    nameLabel.Position = UDim2.fromOffset(12, 0)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = label
+    nameLabel.TextColor3 = Theme.Text
+    nameLabel.Font = Enum.Font.GothamMedium
+    nameLabel.TextSize = 12
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.Parent = row
+
+    local status = Instance.new("TextLabel")
+    status.Name = "Status"
+    status.Size = UDim2.fromOffset(56, 22)
+    status.Position = UDim2.new(1, -66, 0.5, -11)
+    status.BackgroundColor3 = Theme.Off
+    status.Text = "OFF"
+    status.TextColor3 = Theme.TextDim
+    status.Font = Enum.Font.GothamBold
+    status.TextSize = 10
+    status.BorderSizePixel = 0
+    status.Parent = row
+    Instance.new("UICorner", status).CornerRadius = UDim.new(0, 5)
+
+    local function render()
+        local on = getState()
+        if gated and gated() then
+            nameLabel.TextColor3 = Theme.TextMuted
+            status.Text = "GATED"
+            status.BackgroundColor3 = Theme.Off
+            status.TextColor3 = Theme.TextMuted
+            return
+        end
+        nameLabel.TextColor3 = Theme.Text
+        if on then
+            status.Text = "ON"
+            status.BackgroundColor3 = Theme.On
+            status.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            status.Text = "OFF"
+            status.BackgroundColor3 = Theme.Off
+            status.TextColor3 = Theme.TextDim
+        end
+    end
+
+    row.MouseButton1Click:Connect(function()
+        if gated and gated() then render() return end
+        local newVal = not getState()
+        setState(newVal)
+        render()
+    end)
+    row.MouseEnter:Connect(function()
+        if not (gated and gated()) then
+            row.BackgroundColor3 = Theme.SurfaceHover
+        end
+    end)
+    row.MouseLeave:Connect(function()
+        row.BackgroundColor3 = Theme.Surface
+    end)
+
+    task.spawn(function()
+        while row.Parent and Alive do
+            render()
+            task.wait(0.5)
+        end
+    end)
+
+    render()
+    return render, getState
+end
+
+local function createInfoRow(parent, label, value, order)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 28)
+    row.BackgroundTransparency = 1
+    row.LayoutOrder = order or 0
+    row.Parent = parent
+
+    local left = Instance.new("TextLabel")
+    left.Size = UDim2.new(0.45, 0, 1, 0)
+    left.BackgroundTransparency = 1
+    left.Text = label
+    left.TextColor3 = Theme.TextDim
+    left.Font = Enum.Font.Gotham
+    left.TextSize = 12
+    left.TextXAlignment = Enum.TextXAlignment.Left
+    left.Name = "Label"
+    left.Parent = row
+
+    local right = Instance.new("TextLabel")
+    right.Name = "Value"
+    right.Size = UDim2.new(0.55, 0, 1, 0)
+    right.Position = UDim2.new(0.45, 0, 0, 0)
+    right.BackgroundTransparency = 1
+    right.Text = value
+    right.TextColor3 = Theme.Text
+    right.Font = Enum.Font.GothamMedium
+    right.TextSize = 12
+    right.TextXAlignment = Enum.TextXAlignment.Right
+    right.Parent = row
+
+    return right
+end
+
+local function createValueRow(parent, label, getValue, setValue, step, minV, maxV, order)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 36)
+    row.BackgroundColor3 = Theme.Surface
+    row.BackgroundTransparency = 0.15
+    row.BorderSizePixel = 0
+    row.LayoutOrder = order or 0
+    row.Parent = parent
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 7)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Theme.BorderSoft
+    stroke.Thickness = 1
+    stroke.Transparency = 0.6
+    stroke.Parent = row
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(1, -140, 1, 0)
+    nameLabel.Position = UDim2.fromOffset(12, 0)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = label
+    nameLabel.TextColor3 = Theme.Text
+    nameLabel.Font = Enum.Font.GothamMedium
+    nameLabel.TextSize = 12
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.Parent = row
+
+    local function formatVal(v)
+        if math.abs(v - math.floor(v + 0.0001)) < 0.001 then
+            return tostring(math.floor(v + 0.0001))
+        end
+        return string.format("%.1f", v)
+    end
+
+    local valBox = Instance.new("TextBox")
+    valBox.Size = UDim2.fromOffset(52, 22)
+    valBox.Position = UDim2.new(1, -118, 0.5, -11)
+    valBox.BackgroundColor3 = Theme.Off
+    valBox.Text = formatVal(getValue())
+    valBox.TextColor3 = Theme.Accent
+    valBox.Font = Enum.Font.GothamBold
+    valBox.TextSize = 12
+    valBox.ClearTextOnFocus = false
+    valBox.BorderSizePixel = 0
+    valBox.Parent = row
+    Instance.new("UICorner", valBox).CornerRadius = UDim.new(0, 5)
+
+    local function commit(raw)
+        local n = tonumber(raw)
+        if not n then
+            valBox.Text = formatVal(getValue())
+            return
+        end
+        if n < minV then n = minV end
+        if n > maxV then n = maxV end
+        if step >= 1 then
+            n = math.floor(n + 0.5)
+        end
+        setValue(n)
+        valBox.Text = formatVal(n)
+        applyMovement()
+    end
+
+    valBox.FocusLost:Connect(function(enter)
+        commit(valBox.Text)
+    end)
+
+    local function makeBtn(text, xOff, delta)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(26, 22)
+        b.Position = UDim2.new(1, xOff, 0.5, -11)
+        b.BackgroundColor3 = Theme.Off
+        b.Text = text
+        b.TextColor3 = Theme.Text
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 14
+        b.AutoButtonColor = false
+        b.BorderSizePixel = 0
+        b.Parent = row
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+        b.MouseButton1Click:Connect(function()
+            local v = getValue() + delta
+            if v < minV then v = minV end
+            if v > maxV then v = maxV end
+            setValue(v)
+            valBox.Text = formatVal(v)
+            applyMovement()
+        end)
+        return b
+    end
+
+    makeBtn("−", -80, -step)
+    makeBtn("+", -48, step)
+
+    return valBox
+end
+
+createNavButton("Home", 1, "⌂")
+local homePage = createPage("Home")
+
+do
+    local card, body = createCard(homePage, "Eggzy Hub", 1)
+    local statusRight = createInfoRow(body, "Status", "Active", 1)
+    statusRight.TextColor3 = Theme.Success
+
+    local card2, body2 = createCard(homePage, "Quick Status", 2)
+    createInfoRow(body2, "Auto Quest", "OFF", 1)
+    createInfoRow(body2, "Scroll Stealer", "OFF", 2)
+    createInfoRow(body2, "Instant Kill", "OFF", 3)
+    createInfoRow(body2, "Flight", "OFF", 4)
+    createInfoRow(body2, "Village", "Unknown", 5)
+    createInfoRow(body2, "Y Pos", "—", 6)
+    createInfoRow(body2, "Mentor", "off", 7)
+
+    task.spawn(function()
+        while Alive and task.wait(1.0) do
+            local root = select(1, getRoot())
+            local yText = root and string.format("%.0f", root.Position.Y) or "—"
+            local mentorText = MentorInfo.phase
+            if MentorInfo.name and State.Mentor then
+                mentorText = MentorInfo.name .. " | " .. MentorInfo.phase
+            end
+            if State.Mentor then
+                mentorText = (Config.Mentor.Mission >= 6 and "T5/5 done " or string.format("T%d/5 ", Config.Mentor.Mission)) .. mentorText
+            end
+            local map = {
+                ["Auto Quest"] = State.AutoQuest,
+                ["Scroll Stealer"] = State.Scrolls,
+                ["Instant Kill"] = State.Kill,
+                ["Flight"] = State.Fly,
+                ["Village"] = CurrentVillage,
+                ["Y Pos"] = yText,
+                ["Mentor"] = mentorText,
+            }
+            for _, child in ipairs(body2:GetChildren()) do
+                if child:IsA("Frame") then
+                    local left = child:FindFirstChild("Label")
+                    local val = child:FindFirstChild("Value")
+                    if left and val then
+                        if map[left.Text] ~= nil then
+                            local stateVal = map[left.Text]
+                            if type(stateVal) == "boolean" then
+                                val.Text = stateVal and "ON" or "OFF"
+                                val.TextColor3 = stateVal and Theme.Success or Theme.TextDim
+                            else
+                                val.Text = tostring(stateVal)
+                                val.TextColor3 = Theme.Accent
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+createNavButton("Player", 2, "◈")
+local playerPage = createPage("Player")
+
+do
+    local card, body = createCard(playerPage, "Movement", 1)
+    createToggle(body, "Flight", 1, function() return State.Fly end, function(v)
+        State.Fly = v
+        if v then startFly() else stopFly() end
+    end)
+    createValueRow(body, "Flight Speed", function() return Config.FlySpeed end, function(v) Config.FlySpeed = v end, 5, 10, 300, 2)
+    createToggle(body, "Noclip", 3, function() return State.Noclip end, function(v)
+        State.Noclip = v
+    end)
+    createToggle(body, "Speed", 4, function() return State.Speed end, function(v)
+        State.Speed = v
+        if not v then
+            local _, hum = getRoot()
+            if hum then hum.WalkSpeed = defaultWalkSpeed end
+        end
+    end)
+    createValueRow(body, "Speed Value", function() return Config.WalkSpeed end, function(v) Config.WalkSpeed = v end, 2, 1, 200, 5)
+    createToggle(body, "Infinite Jump", 6, function() return State.InfiniteJump end, function(v)
+        State.InfiniteJump = v
+    end)
+end
+
+do
+    local card, body = createCard(playerPage, "Coordinates", 2)
+    local posValue = createInfoRow(body, "Position (X, Y, Z)", "—", 1)
+    posValue.TextColor3 = Theme.Accent
+
+    -- Direction checker. Roblox: Y is up, right-handed. Heading is degrees clockwise seen from above,
+    -- 0 = -Z, 90 = +X, 180 = +Z, 270 = -X. That "North = -Z" labelling is my convention, not a game value.
+    local headingValue = createInfoRow(body, "Facing (heading / compass)", "—", 2)
+    headingValue.TextColor3 = Theme.Accent
+    local lookValue = createInfoRow(body, "Look vector (X, Y, Z)", "—", 3)
+    lookValue.TextColor3 = Theme.Accent
+
+    local compass = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" }
+    task.spawn(function()
+        while Alive and task.wait(0.1) do
+            local root = getRoot()
+            if root then
+                local p = root.Position
+                posValue.Text = string.format("%.1f, %.1f, %.1f", p.X, p.Y, p.Z)
+                local look = root.CFrame.LookVector
+                lookValue.Text = string.format("%.3f, %.3f, %.3f", look.X, look.Y, look.Z)
+                if look.X * look.X + look.Z * look.Z < 1e-6 then
+                    headingValue.Text = "straight up/down"
+                else
+                    local deg = math.deg(math.atan2(look.X, -look.Z)) % 360
+                    local idx = math.floor((deg + 22.5) / 45) % 8 + 1
+                    headingValue.Text = string.format("%.1f° %s", deg, compass[idx])
+                end
+            else
+                posValue.Text = "—"
+                headingValue.Text = "—"
+                lookValue.Text = "—"
+            end
+        end
+    end)
+end
+
+createNavButton("Auto", 3, "↻")
+local autoPage = createPage("Auto")
+
+do
+    local card, body = createCard(autoPage, "Quest & Farm", 1)
+    createToggle(body, "Money Grind", 3, function() return State.Grind end, function(v)
+        State.Grind = v
+        if v then
+            State.AutoQuest = true
+            State.TpScroll = true
+            State.Kill = true
+            State.Fly = true
+            startFly()
+            table.clear(visited)
+            table.clear(Config.Quest.Selected)
+            for _, n in ipairs(Config.Bosses) do
+                if questRemote(n) then
+                    Config.Quest.Selected[n] = true
+                end
+            end
+            refreshBossList()
+            local cam = Workspace.CurrentCamera
+            local root = getRoot()
+            if cam and root then
+                local pos = cam.CFrame.Position
+                cam.CFrame = CFrame.lookAt(pos, root.Position + Vector3.new(0, 90, 0))
+            end
+            forceReleaseInputs()
+        else
+            State.AutoQuest = false
+            State.TpScroll = false
+            State.Kill = false
+            State.Fly = false
+            stopFly()
+            table.clear(Config.Quest.Selected)
+            refreshBossList()
+            forceReleaseInputs()
+            local _, hum = getRoot()
+            if hum then
+                pcall(function()
+                    hum.Health = 0
+                    hum:TakeDamage(hum.MaxHealth)
+                end)
+            end
+            local char = LocalPlayer.Character
+            if char then
+                pcall(function() char:BreakJoints() end)
+            end
+        end
+    end)
+    createToggle(body, "Instant Kill", 4, function() return State.Kill end, function(v)
+        State.Kill = v
+    end)
+end
+
+do
+    local card, body = createCard(autoPage, "Mentor", 2)
+
+    createToggle(body, "Auto Mentor", 1, function() return State.Mentor end, function(v)
+        State.Mentor = v
+        if not v then forceReleaseInputs() end
+    end, function() return mentorMissionsFolder() == nil and Config.Mentor.Mission ~= 5 end)
+    createValueRow(body, "Start at training (0 = all)", function()
+        if T3.all and Config.Mentor.Mission == 1 then return 0 end
+        return math.min(Config.Mentor.Mission, 5)
+    end, function(n)
+        T3.all = (n == 0)
+        n = math.max(n, 1)
+        Config.Mentor.Mission = n
+        T3.progress = n
+        T3.saveProgress()
+    end, 1, 0, 5, 2)
+
+end
+
+do
+    -- Rank Up: LocalPlayer.startevent:FireServer("rankup") (captured with WrenchSpy). Pure remote call: it never moves the player.
+    -- Interval is an ASSUMED pause between automatic fires; the game's own cooldown is not known.
+    Config.RankUp = { Interval = 5 }
+    local RK = { lastFire = 0 }
+
+    function RK.fire()
+        local remote = LocalPlayer:FindFirstChild("startevent")
+        if not remote or not remote:IsA("RemoteEvent") then
+            print("[EggzyRank] LocalPlayer.startevent not found")
+            return false
+        end
+        local okFire, err = pcall(function() remote:FireServer("rankup") end)
+        if not okFire then
+            print("[EggzyRank] fire failed: " .. tostring(err))
+            return false
+        end
+        RK.lastFire = os.clock()
+        return true
+    end
+
+    task.spawn(function()
+        while Alive do
+            if State.AutoRank and os.clock() - RK.lastFire >= Config.RankUp.Interval then
+                RK.fire()
+            end
+            task.wait(0.25)
+        end
+    end)
+
+    local card, body = createCard(autoPage, "Rank Up", 4)
+
+    local btn = Instance.new("TextButton")
+    btn.Name = "Rank Up"
+    btn.Size = UDim2.new(1, 0, 0, 36)
+    btn.BackgroundColor3 = Theme.Off
+    btn.BorderSizePixel = 0
+    btn.Text = "Rank Up"
+    btn.TextColor3 = Theme.Text
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 12
+    btn.AutoButtonColor = true
+    btn.LayoutOrder = 1
+    btn.Parent = body
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
+    btn.MouseButton1Click:Connect(RK.fire)
+
+    createToggle(body, "Auto Rank Up", 2, function() return State.AutoRank end, function(v)
+        State.AutoRank = v
+    end)
+end
+
+do
+    local card, body = createCard(autoPage, "Quest Bosses", 3)
+
+    local countLabel = Instance.new("TextLabel")
+    countLabel.Name = "Count"
+    countLabel.Size = UDim2.new(1, 0, 0, 22)
+    countLabel.BackgroundTransparency = 1
+    countLabel.Text = "0 selected"
+    countLabel.TextColor3 = Theme.TextDim
+    countLabel.Font = Enum.Font.Gotham
+    countLabel.TextSize = 11
+    countLabel.TextXAlignment = Enum.TextXAlignment.Left
+    countLabel.LayoutOrder = 0
+    countLabel.Parent = body
+
+    local btnRow = Instance.new("Frame")
+    btnRow.Size = UDim2.new(1, 0, 0, 28)
+    btnRow.BackgroundTransparency = 1
+    btnRow.LayoutOrder = 1
+    btnRow.Parent = body
+
+    local btnLayout = Instance.new("UIListLayout", btnRow)
+    btnLayout.FillDirection = Enum.FillDirection.Horizontal
+    btnLayout.Padding = UDim.new(0, 6)
+
+    local function smallBtn(text, fn)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.fromOffset(0, 26)
+        b.AutomaticSize = Enum.AutomaticSize.X
+        b.BackgroundColor3 = Theme.Surface
+        b.Text = "  " .. text .. "  "
+        b.TextColor3 = Theme.Text
+        b.Font = Enum.Font.GothamMedium
+        b.TextSize = 11
+        b.AutoButtonColor = false
+        b.BorderSizePixel = 0
+        b.Parent = btnRow
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+        local s = Instance.new("UIStroke")
+        s.Color = Theme.Border
+        s.Thickness = 1
+        s.Transparency = 0.5
+        s.Parent = b
+        b.MouseButton1Click:Connect(fn)
+        return b
+    end
+
+    local bossList = Instance.new("ScrollingFrame")
+    bossList.Name = "BossList"
+    bossList.Size = UDim2.new(1, 0, 0, 220)
+    bossList.BackgroundColor3 = Theme.Surface
+    bossList.BackgroundTransparency = 0.3
+    bossList.BorderSizePixel = 0
+    bossList.ScrollBarThickness = 3
+    bossList.ScrollBarImageColor3 = Theme.Accent
+    bossList.CanvasSize = UDim2.new()
+    bossList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    bossList.LayoutOrder = 2
+    bossList.Parent = body
+    Instance.new("UICorner", bossList).CornerRadius = UDim.new(0, 6)
+
+    local listPad = Instance.new("UIPadding", bossList)
+    listPad.PaddingTop = UDim.new(0, 4)
+    listPad.PaddingBottom = UDim.new(0, 4)
+    listPad.PaddingLeft = UDim.new(0, 4)
+    listPad.PaddingRight = UDim.new(0, 4)
+
+    local listLayout = Instance.new("UIListLayout", bossList)
+    listLayout.Padding = UDim.new(0, 2)
+    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local rows = {}
+
+    local function updateCount()
+        local n = 0
+        for _ in pairs(Config.Quest.Selected) do n += 1 end
+        countLabel.Text = n .. " selected"
+    end
+
+    local function renderRow(name, idx)
+        local row = rows[name]
+        if not row then return end
+        local picked = Config.Quest.Selected[name] == true
+        local inMap = questRemote(name) ~= nil
+        row.Text = (picked and "  [x]  " or "  [  ]  ") .. name
+        row.BackgroundColor3 = picked and Theme.Picked or Theme.Surface
+        row.TextColor3 = inMap and Theme.Text or Theme.TextMuted
+        row.LayoutOrder = (inMap and 0 or 1000) + (idx or 0)
+    end
+
+    local function renderAll()
+        for idx, name in ipairs(Config.Bosses) do
+            renderRow(name, idx)
+        end
+        updateCount()
+    end
+    refreshBossList = renderAll
+
+    smallBtn("All", function()
+        for _, n in ipairs(Config.Bosses) do Config.Quest.Selected[n] = true end
+        renderAll()
+    end)
+    smallBtn("None", function()
+        table.clear(Config.Quest.Selected)
+        renderAll()
+    end)
+    smallBtn("This Map", function()
+        table.clear(Config.Quest.Selected)
+        for _, n in ipairs(Config.Bosses) do
+            if questRemote(n) then Config.Quest.Selected[n] = true end
+        end
+        renderAll()
+    end)
+
+    for idx, name in ipairs(Config.Bosses) do
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, 0, 0, 24)
+        row.BackgroundColor3 = Theme.Surface
+        row.Text = "  [  ]  " .. name
+        row.TextColor3 = Theme.Text
+        row.Font = Enum.Font.Gotham
+        row.TextSize = 11
+        row.TextXAlignment = Enum.TextXAlignment.Left
+        row.AutoButtonColor = false
+        row.BorderSizePixel = 0
+        row.LayoutOrder = idx
+        row.Parent = bossList
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+
+        row.MouseButton1Click:Connect(function()
+            Config.Quest.Selected[name] = (not Config.Quest.Selected[name]) or nil
+            renderRow(name, idx)
+            updateCount()
+        end)
+        rows[name] = row
+    end
+
+    task.spawn(function()
+        while bossList.Parent and Alive do
+            renderAll()
+            task.wait(1.0)
+        end
+    end)
+
+    renderAll()
+end
+
+createNavButton("Scrolls", 4, "◇")
+local scrollsPage = createPage("Scrolls")
+
+do
+    local card, body = createCard(scrollsPage, "Scroll Stealer", 1)
+    createToggle(body, "Scroll Stealer (all)", 1, function() return State.Scrolls end, function(v)
+        State.Scrolls = v
+    end)
+end
+
+createNavButton("ESP", 5, "◎")
+local espPage = createPage("ESP")
+
+do
+    local card, body = createCard(espPage, "Visuals", 1)
+    createToggle(body, "ESP Players", 1, function() return State.ESP.Players end, function(v)
+        State.ESP.Players = v
+    end)
+    createToggle(body, "ESP Scrolls", 2, function() return State.ESP.ScrollESP end, function(v)
+        State.ESP.ScrollESP = v
+    end)
+    createToggle(body, "ESP Boss NPCs", 3, function() return State.ESP.BossNPCESP end, function(v)
+        State.ESP.BossNPCESP = v
+    end)
+end
+
+setPage("Home")
+
+do
+    local dragging, startPos, startInput
+    topBar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging, startPos, startInput = true, main.Position, i.Position
+        end
+    end)
+    logoFrame.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging, startPos, startInput = true, main.Position, i.Position
+        end
+    end)
+    track(UserInputService.InputChanged:Connect(function(i)
+        if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+            local d = i.Position - startInput
+            main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end))
+end
+
+track(UserInputService.InputBegan:Connect(function(i, gp)
+    if i.KeyCode == Config.ToggleKey or i.KeyCode == Config.BackupToggleKey then
+        main.Visible = not main.Visible
+    end
+end))
+
+track(LocalPlayer.Chatted:Connect(function(msg)
+    if msg:lower() == "!ui" then
+        main.Visible = not main.Visible
+    end
+end))
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(28, 22)
+closeBtn.Position = UDim2.new(1, -38, 0, 13)
+closeBtn.BackgroundColor3 = Theme.Surface
+closeBtn.BackgroundTransparency = 0.2
+closeBtn.Text = "×"
+closeBtn.TextColor3 = Theme.Text
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 16
+closeBtn.ZIndex = 5
+closeBtn.Parent = topBar
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 5)
+
+closeBtn.MouseButton1Click:Connect(function()
     Alive = false
-    onLogChanged = nil
-    pcall(function() keyConn:Disconnect() end)
-    pcall(function() drainConn:Disconnect() end)
-    pcall(function() gui:Destroy() end)
-end
+    State.Mentor = false
+    pcall(stopFaceLock)
+    pcall(T3.stopAim)
+    stopFly()
+    forceReleaseInputs()
+    pcall(function() getgenv().EggzyPanic = nil end)
+    pcall(function() ESP_Folder:Destroy() end)
+    for _, conn in ipairs(connections) do
+        if typeof(conn) == "RBXScriptConnection" then
+            conn:Disconnect()
+        end
+    end
+    pcall(function()
+        if BossScrollESP_Folder then
+            BossScrollESP_Folder:Destroy()
+        end
+    end)
+    pcall(function()
+        gui:Destroy()
+    end)
+    print("[EggzyHub] Unloaded completely.")
+end)
 
-if getgenv then
-    getgenv().WrenchSpyInstance = { Stop = stop }
-end
-
-print("[WrenchSpy] running. Do the action once (e.g. talk to the rank-up NPC), then press Copy last / Copy all. F8 hides the window.")
+print("[EggzyHub] Loaded successfully.")
