@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.111-fbscript",
+    BuildNote = "v1.7.112-fbrender",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3626,32 +3626,54 @@ Config.Fullbright = {
 State.Fullbright = false
 State.BlindFB = false
 
+for key, value in pairs(Config.Fullbright.Lighting) do
+    track(Lighting:GetPropertyChangedSignal(key):Connect(function()
+        if T3.fbActive then
+            pcall(function()
+                if Lighting[key] ~= value then Lighting[key] = value end
+            end)
+        end
+    end))
+end
+
+-- Same effect as the Lighting.Changed hook in the script you sent: the game's own change is overwritten at once, not a frame later.
+function T3.fbHandleEffect(inst)
+    local fb = Config.Fullbright
+    for _, className in ipairs(fb.EffectClasses) do
+        if inst:IsA(className) then
+            local saved = T3.fbSaved
+            if saved and saved.effects[inst] == nil then
+                saved.effects[inst] = inst.Enabled
+                saved.conns[#saved.conns + 1] = inst:GetPropertyChangedSignal("Enabled"):Connect(function()
+                    if T3.fbActive and inst.Enabled then pcall(function() inst.Enabled = false end) end
+                end)
+            end
+            if inst.Enabled then pcall(function() inst.Enabled = false end) end
+            return
+        end
+    end
+end
+
 function T3.fbApply()
     local fb = Config.Fullbright
     if not T3.fbSaved then
-        T3.fbSaved = { props = {}, effects = {} }
+        T3.fbSaved = { props = {}, effects = {}, conns = {} }
         for key in pairs(fb.Lighting) do
             local okR, value = pcall(function() return Lighting[key] end)
             if okR then T3.fbSaved.props[key] = value end
         end
-        T3.fbNextScan = 0
+        T3.fbSaved.conns[#T3.fbSaved.conns + 1] = Lighting.DescendantAdded:Connect(function(inst)
+            if T3.fbActive then pcall(T3.fbHandleEffect, inst) end
+        end)
+        T3.fbActive = true
+        for _, inst in ipairs(Lighting:GetDescendants()) do
+            pcall(T3.fbHandleEffect, inst)
+        end
     end
     for key, value in pairs(fb.Lighting) do
         pcall(function()
             if Lighting[key] ~= value then Lighting[key] = value end
         end)
-    end
-    if os.clock() >= (T3.fbNextScan or 0) then
-        T3.fbNextScan = os.clock() + fb.EffectScan
-        for _, inst in ipairs(Lighting:GetDescendants()) do
-            for _, className in ipairs(fb.EffectClasses) do
-                if inst:IsA(className) then
-                    if T3.fbSaved.effects[inst] == nil then T3.fbSaved.effects[inst] = inst.Enabled end
-                    if inst.Enabled then pcall(function() inst.Enabled = false end) end
-                    break
-                end
-            end
-        end
     end
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild("HumanoidRootPart")
@@ -3667,6 +3689,8 @@ end
 function T3.fbRestore()
     local saved = T3.fbSaved
     if saved then
+        T3.fbActive = false
+        for _, conn in ipairs(saved.conns) do pcall(function() conn:Disconnect() end) end
         for key, value in pairs(saved.props) do
             pcall(function() Lighting[key] = value end)
         end
@@ -3688,14 +3712,21 @@ function T3.blinded()
     return okD and result == true
 end
 
--- every frame (Heartbeat), not every 0.1 s: the game rewrites Lighting constantly, and a slower loop is what made it flicker
-track(RunService.Heartbeat:Connect(function()
-    if State.Fullbright or (State.BlindFB and T3.blinded()) then
+-- every frame, at the last render priority (after the game's own RenderStepped code), so the frame that is drawn already has our values
+T3.blindWas = false
+pcall(function() RunService:UnbindFromRenderStep("EggzyFullbright") end)
+RunService:BindToRenderStep("EggzyFullbright", Enum.RenderPriority.Last.Value, function()
+    local blind = T3.blinded()
+    if blind ~= T3.blindWas then
+        T3.blindWas = blind
+        print("[EggzyBlind] inksplash " .. (blind and "appeared" or "gone") .. " | when-blinded toggle is " .. (State.BlindFB and "ON" or "OFF"))
+    end
+    if State.Fullbright or (State.BlindFB and blind) then
         T3.fbApply()
     else
         T3.fbRestore()
     end
-end))
+end)
 
 -- Fullbright toggles live on the Player page (card order 3); they are created here because they need Config.Blind and T3.fb* defined above.
 do
@@ -4081,6 +4112,7 @@ Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 5)
 closeBtn.MouseButton1Click:Connect(function()
     Alive = false
     State.Mentor = false
+    pcall(function() RunService:UnbindFromRenderStep("EggzyFullbright") end)
     pcall(T3.fbRestore)
     pcall(stopFaceLock)
     pcall(T3.stopAim)
