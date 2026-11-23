@@ -62,7 +62,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.87-mentor",
+    BuildNote = "v1.7.88-scroll",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -205,6 +205,12 @@ local Config = {
         },
     },
     Scroll = {
+        Clicks       = 3,           -- from you: click the scroll 3 times
+        ClickGap     = 0.25,        -- seconds between clicks (uncalibrated)
+        ClickHold    = 0.05,        -- how long each click is held (uncalibrated)
+        ClickHeight  = 6,           -- studs above the scroll you hover while looking straight down (uncalibrated)
+        Settle       = 0.3,         -- seconds to wait at the scroll before the first click (uncalibrated)
+        Scan         = 1,           -- seconds between scroll scans
         PartName     = "sh",
         RemoteName   = "invoke",
         MinY         = -1000,
@@ -304,6 +310,7 @@ local State = {
     Scrolls = false, TpScroll = false, Grind = false, Fps = false,
     Speed = false, Jump = false, InfiniteJump = false, Mentor = false,
     Returning = false,
+    ScrollTrip = false, -- true while the scroll stealer is away from the grind position
     BossAlive = nil,
     ESP = { ScrollESP = false, Players = false, BossNPCESP = false } 
 }
@@ -698,7 +705,7 @@ track(RunService.RenderStepped:Connect(function()
         ensureFlyMovers(root, hum)
     end
 
-    if State.Grind then
+    if State.Grind and not State.ScrollTrip then
         local pos = cam.CFrame.Position
         cam.CFrame = CFrame.lookAt(pos, root.Position + Vector3.new(0, 90, 0))
     end
@@ -978,6 +985,7 @@ local function findBossPart(boss, fromPos)
 end
 
 local function placeUnder(part, height)
+    if State.ScrollTrip then return false end
     local root, hum = getRoot()
     if not (root and part) then return false end
     root.CFrame = CFrame.new(part.Position + Vector3.new(0, height, 0))
@@ -2506,6 +2514,149 @@ task.spawn(function()
             end)
         end
         task.wait(0.1)
+    end
+end)
+
+-- ===================== SCROLL STEALER =====================
+-- Runs only while Money Grind AND Scroll Stealer are on. When a scroll model exists that you do not own:
+-- remember where you stand, hover Config.Scroll.ClickHeight studs above it looking straight down,
+-- click M1 Config.Scroll.Clicks times, then put you back where you were (under the boss if the grind was
+-- fighting one, otherwise the exact spot you left). Which models count as scrolls is inferred from the ESP
+-- code: models in Workspace.npc or Workspace.GLOBALTIME that isScrollModel accepts, plus Workspace children
+-- named like a scroll. That is not confirmed against a real drop yet.
+local SC = { attempts = setmetatable({}, { __mode = "k" }), bound = false, aimPos = nil, camHeight = 10 }
+local SC_BIND = "EggzyScrollAim"
+
+function SC.candidates()
+    local list, seen = {}, {}
+    local function add(m, full)
+        if seen[m] or not m:IsA("Model") or m:FindFirstChildOfClass("Humanoid") then return end
+        local name = m.Name:lower()
+        local ok
+        if full then
+            ok = isScrollModel(m)
+        else
+            ok = (name:find("scroll", 1, true) ~= nil and not name:find("mission", 1, true) and not m:FindFirstChild("missiongiver"))
+                or name:sub(1, #SCROLL_PREFIX) == SCROLL_PREFIX and not name:find("mission", 1, true)
+        end
+        if ok then
+            seen[m] = true
+            list[#list + 1] = m
+        end
+    end
+    local npc = Workspace:FindFirstChild("npc")
+    if npc then for _, m in ipairs(npc:GetChildren()) do add(m, true) end end
+    local gt = Workspace:FindFirstChild("GLOBALTIME")
+    if gt then for _, m in ipairs(gt:GetChildren()) do add(m, true) end end
+    for _, m in ipairs(Workspace:GetChildren()) do add(m, false) end
+    return list
+end
+
+function SC.unbindAim()
+    SC.aimPos = nil
+    if SC.bound then
+        SC.bound = false
+        pcall(function() RunService:UnbindFromRenderStep(SC_BIND) end)
+    end
+end
+
+function SC.bindAim()
+    if SC.bound then return end
+    SC.bound = true
+    RunService:BindToRenderStep(SC_BIND, Enum.RenderPriority.Camera.Value + 1, function()
+        local cam = Workspace.CurrentCamera
+        if not (cam and SC.aimPos) then return end
+        cam.CFrame = CFrame.lookAt(SC.aimPos + Vector3.new(0, SC.camHeight, 0), SC.aimPos, Vector3.zAxis)
+    end)
+end
+
+-- Returns true when the trip ran (clicks were sent); you are always put back afterwards.
+function SC.trip(model)
+    local cfg = Config.Scroll
+    local part = Config.ESP.ScrollESP.Adornee(model)
+    if not (part and part:IsA("BasePart") and part:IsDescendantOf(Workspace)) then return false end
+    local pos = part.Position
+    if pos ~= pos or pos.Y < cfg.MinY or pos.Y > cfg.MaxY then return false end
+    local root = getRoot()
+    if not root then return false end
+    local saved = root.CFrame
+
+    State.ScrollTrip = true
+    local ok, err = pcall(function()
+        local hoverCF = CFrame.lookAt(pos + Vector3.new(0, cfg.ClickHeight, 0), pos, Vector3.zAxis)
+        SC.camHeight = cfg.ClickHeight + 4
+        SC.aimPos = pos
+        SC.bindAim()
+        local function hold()
+            local r = getRoot()
+            if r then
+                r.CFrame = hoverCF
+                r.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+        local function holdFor(seconds)
+            local untilT = os.clock() + seconds
+            repeat
+                hold()
+                task.wait(0.05)
+            until os.clock() >= untilT or not Alive
+        end
+        holdFor(cfg.Settle)
+        for i = 1, cfg.Clicks do
+            if not (Alive and State.Scrolls and State.Grind) then break end
+            hold()
+            local cam = Workspace.CurrentCamera
+            if okVim and VIM and cam then
+                local vp = cam.ViewportSize
+                pcall(function() VIM:SendMouseMoveEvent(vp.X / 2, vp.Y / 2, game) end)
+            end
+            local sent = false
+            for _ = 1, 10 do
+                if clickM1(cfg.ClickHold) then sent = true break end
+                task.wait(0.05)
+            end
+            if Config.Debug then
+                print(string.format("[EggzyScroll] click %d/%d on %s sent=%s", i, cfg.Clicks, model.Name, tostring(sent)))
+            end
+            holdFor(cfg.ClickGap)
+        end
+    end)
+    SC.unbindAim()
+    local r = getRoot()
+    if r then
+        r.CFrame = saved
+        r.AssemblyLinearVelocity = Vector3.zero
+    end
+    State.ScrollTrip = false
+    if not ok and Config.Debug then
+        print("[EggzyScroll] trip error:", err)
+    end
+    return ok
+end
+
+task.spawn(function()
+    while Alive do
+        task.wait(Config.Scroll.Scan)
+        if State.Scrolls and State.Grind and not State.ScrollTrip then
+            local root, hum = getRoot()
+            if root and hum and hum.Health > 0 then
+                local ok, list = pcall(SC.candidates)
+                if ok then
+                    for _, m in ipairs(list) do
+                        local tries = SC.attempts[m] or 0
+                        if tries < Config.Scroll.MaxAttempts and m.Parent and not Config.Scroll.OwnsScroll(m) then
+                            SC.attempts[m] = tries + 1
+                            if Config.Debug then
+                                print(string.format("[EggzyScroll] scroll %s (attempt %d/%d)", m.Name, tries + 1, Config.Scroll.MaxAttempts))
+                            end
+                            pcall(SC.trip, m)
+                            task.wait(Config.Scroll.AttemptDelay)
+                            break
+                        end
+                    end
+                end
+            end
+        end
     end
 end)
 
