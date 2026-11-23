@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.121-statpriority",
+    BuildNote = "v1.7.122-rankbelow",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 121 },
+    Version = { Tweaks = 122 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3869,7 +3869,7 @@ do
         end
     end)
 
-    local card, body = createCard(autoPage, "Rank Up", 4)
+    local card, body = createCard(autoPage, "Rank Up", 6)
 
     local btn = Instance.new("TextButton")
     btn.Name = "Rank Up"
