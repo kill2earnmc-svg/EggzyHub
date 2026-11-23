@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.97-inmap",
+    BuildNote = "v1.7.98-inputfix",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -628,7 +628,7 @@ end))
 
 -- ===================== INPUT HELPERS =====================
 local heldKeys = {}
-local pressing = false
+local pressing = false -- false, or the os.clock() when an input routine started; older than 5 s counts as stale (a routine that died mid-press must not block input forever)
 local mouseHeld = false
 
 local function sendKey(down, keyCode)
@@ -1021,8 +1021,8 @@ local function placeUnder(part, height)
 end
 
 local function pressKey(keyCode, hold)
-    if pressing then return end
-    pressing = true
+    if pressing and os.clock() - pressing < 5 then return end
+    pressing = os.clock()
     heldKeys[keyCode] = true
     if pcall(sendKey, true, keyCode) then
         task.wait(hold)
@@ -1386,7 +1386,12 @@ task.spawn(function()
             nextPress = armedAt
         end
         
-        if cfg.SpamQ and boss and os.clock() >= armedAt and windowFocused and not UserInputService:GetFocusedTextBox() then
+        if cfg.SpamQ and boss and os.clock() >= armedAt and windowFocused then
+            -- a focused TextBox (chat, a hub box) swallows every key: let go of it instead of silently stopping the Q spam
+            local focusedBox = UserInputService:GetFocusedTextBox()
+            if focusedBox and os.clock() >= nextPress then
+                pcall(function() focusedBox:ReleaseFocus() end)
+            end
             local root = getRoot()
             if root then
                 local part, dist = livingBossPart(boss, root.Position)
@@ -1864,8 +1869,8 @@ local function detectMentorName()
 end
 
 local function clickM1(hold)
-    if pressing then return false end
-    pressing = true
+    if pressing and os.clock() - pressing < 5 then return false end
+    pressing = os.clock()
     mouseHeld = true
     local ok = pcall(sendMouse, true)
     if ok then task.wait(hold) end
@@ -1881,11 +1886,11 @@ end
 -- reads the key or the humanoid. The key is always released, even on panic or toggle-off.
 local function holdJump(hold)
     local deadline = os.clock() + 2
-    while pressing and os.clock() < deadline do
+    while pressing and os.clock() - pressing < 5 and os.clock() < deadline do
         task.wait(0.05)
     end
-    if pressing then return false end
-    pressing = true
+    if pressing and os.clock() - pressing < 5 then return false end
+    pressing = os.clock()
     local space = Enum.KeyCode.Space
     heldKeys[space] = true
     pcall(sendKey, true, space)
