@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.127-dungeonbosses",
+    BuildNote = "v1.7.129-bossrounds",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 127 },
+    Version = { Tweaks = 129 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -4160,6 +4160,10 @@ do
         -- eleven codes follow from your statement and are unverified.
         RemoteName = "pressplay",
         EnterArg = {},
+        -- Structure-based boss detection (no names needed), UNVERIFIED on dungeon bosses: an npc counts as a boss when it carries a "bossdrop" StringValue
+        -- (the field bosses do) or its MaxHealth is at least HpFactor times the median MaxHealth of the npcs around (needs 3+ npcs). Names still count too.
+        StructureDetect = true,
+        HpFactor = 5, -- ASSUMED multiplier
         AuraRange = 300,      -- studs, ASSUMED kill-aura reach (the hub's Instant Kill uses 120)
         Interval = 0.25,
     }
@@ -4168,7 +4172,7 @@ do
     end
     State.AutoDungeon = false
     State.Dungeon = Config.Dungeons.List[1]
-    local DG = { status = "off", bossSeen = false, bossDone = false, warned = {} }
+    local DG = { status = "off", bossSeen = false, bossDone = false, warned = {}, seen = setmetatable({}, { __mode = "k" }), kills = 0 }
 
     local function dungeonBossNames()
         return Config.Dungeons.Bosses[State.Dungeon] or {}
@@ -4194,7 +4198,7 @@ do
             task.wait(Config.Dungeons.Interval)
             if not State.AutoDungeon then
                 DG.status = "off"
-                DG.bossSeen, DG.bossDone = false, false
+                DG.bossSeen, DG.bossDone, DG.kills = false, false, 0
             else
                 local root = getRoot()
                 local folder = Workspace:FindFirstChild("npc")
@@ -4210,6 +4214,18 @@ do
                         print("[EggzyDungeon] no boss names set for " .. tostring(State.Dungeon) .. " (Config.Dungeons.Bosses), killing mobs only")
                     end
                     local killed, bossAlive = 0, false
+                    local median
+                    if Config.Dungeons.StructureDetect then
+                        local hps = {}
+                        for _, m in ipairs(folder:GetChildren()) do
+                            local hm = m:IsA("Model") and m ~= LocalPlayer.Character and m:FindFirstChildOfClass("Humanoid")
+                            if hm and isLiving(hm) and hm.MaxHealth > 0 then hps[#hps + 1] = hm.MaxHealth end
+                        end
+                        if #hps >= 3 then
+                            table.sort(hps)
+                            median = hps[math.ceil(#hps / 4)] -- lower quartile, so several bosses at once do not drag the baseline up
+                        end
+                    end
                     for _, m in ipairs(folder:GetChildren()) do
                         if m:IsA("Model") and m ~= LocalPlayer.Character then
                             local h = m:FindFirstChildOfClass("Humanoid")
@@ -4219,11 +4235,20 @@ do
                                 for _, key in ipairs(bossKeys) do
                                     if bossMatches(m, key) then isBoss = true break end
                                 end
+                                if not isBoss and Config.Dungeons.StructureDetect then
+                                    local bd = m:FindFirstChild("bossdrop")
+                                    if bd and bd:IsA("StringValue") and bd.Value ~= "" then
+                                        isBoss = true
+                                    elseif median and h.MaxHealth >= median * Config.Dungeons.HpFactor then
+                                        isBoss = true
+                                    end
+                                end
                                 if isBoss then
                                     bossAlive = true
-                                    if not DG.bossSeen then
-                                        DG.bossSeen = true
-                                        print("[EggzyDungeon] boss spawned: " .. m.Name)
+                                    DG.bossSeen, DG.bossDone = true, false
+                                    if not DG.seen[m] then
+                                        DG.seen[m] = true
+                                        print("[EggzyDungeon] boss spawned: " .. tostring(m:FindFirstChild("npctype") and m.npctype.Value or m.Name) .. string.format(" (hp %.0f)", h.MaxHealth))
                                     end
                                     killModel(h, part)
                                     killed += 1
@@ -4236,10 +4261,11 @@ do
                     end
                     if DG.bossSeen and not bossAlive and not DG.bossDone then
                         DG.bossDone = true
-                        print("[EggzyDungeon] boss killed, waiting for the next step")
+                        DG.kills += 1
+                        print("[EggzyDungeon] all bosses dead (round " .. DG.kills .. "), waiting for the next one")
                     end
                     if DG.bossDone then
-                        DG.status = "boss killed, waiting"
+                        DG.status = "bosses dead (" .. DG.kills .. " rounds), waiting"
                     elseif bossAlive then
                         DG.status = "boss alive, killing it"
                     else
@@ -4311,7 +4337,7 @@ do
         Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
         b.MouseButton1Click:Connect(function()
             State.Dungeon = name
-            DG.bossSeen, DG.bossDone = false, false
+            DG.bossSeen, DG.bossDone, DG.kills = false, false, 0
             renderRows()
         end)
         rows[name] = b
@@ -4350,7 +4376,7 @@ do
 
     createToggle(body, "Auto Dungeon (kill aura + boss check)", 4, function() return State.AutoDungeon end, function(v)
         State.AutoDungeon = v
-        DG.bossSeen, DG.bossDone = false, false
+        DG.bossSeen, DG.bossDone, DG.kills = false, false, 0
     end)
 
     local statusLabel = Instance.new("TextLabel")
