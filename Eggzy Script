@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.100-qreset",
+    BuildNote = "v1.7.102-noreset",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -106,7 +106,6 @@ local Config = {
         SpamPeriod = 5,
         SpamHold = 0.05,
         SpamFirstDelay = 1.0,
-        ResetOnStall = true,  -- you reset by hand when Q dies; this does the same after the stall has lasted two watchdog rounds (about 25 s)
     },
     Bosses = BossNames,
     ESP = {
@@ -1439,13 +1438,12 @@ task.spawn(function()
                 end)
                 nextPress = 0
                 cfg.stalls = (cfg.stalls or 0) + 1
-                if cfg.ResetOnStall and cfg.stalls >= 2 and humD then
-                    print("[EggzyQ] still stalled: resetting the character (same as your manual reset)")
-                    cfg.stalls = 0
-                    pcall(function()
-                        humD.Health = 0
-                        if humD.Parent then humD.Parent:BreakJoints() end
-                    end)
+                -- Seen in your log: the boss counted as alive but you were 1317 studs away, so Q (range 150) never fired.
+                -- During Money Grind the right fix is the grind's own move: go back above that boss and forget the "visited" marks.
+                if State.Grind and partD and distD and distD > cfg.SpamRange and cfg.stalls <= 4 then
+                    table.clear(visited)
+                    placeUnder(partD, getBossHeight(boss))
+                    print(string.format("[EggzyQ] %.0f studs from %s: moved back above it", distD, tostring(boss)))
                 end
             end
         end
