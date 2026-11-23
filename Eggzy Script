@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.96-rankup",
+    BuildNote = "v1.7.97-inmap",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3483,6 +3483,29 @@ end
 createNavButton("Auto", 3, "↻")
 local autoPage = createPage("Auto")
 
+-- Is this boss's mission really present in the current map? Strict: the mission folder must exist here and hold the giver remote.
+-- (questRemote also falls back to ANY CLIENTTALK under bossdropmission for firing, which made every boss look "in this map".)
+function T3.inMap(boss)
+    local folder = questFolder()
+    if not folder then return false end
+    local mission = folder:FindFirstChild(boss)
+    if not mission then
+        local key = string.lower(boss):gsub("[^%w]", "")
+        for _, child in ipairs(folder:GetChildren()) do
+            if (string.lower(child.Name):gsub("[^%w]", "")) == key then
+                mission = child
+                break
+            end
+        end
+    end
+    if not mission then return false end
+    local cur = mission
+    for _, n in ipairs(Config.Quest.GiverPath) do
+        cur = cur and cur:FindFirstChild(n)
+    end
+    return cur ~= nil and (cur:IsA("RemoteEvent") or cur:IsA("BaseRemoteEvent"))
+end
+
 do
     local card, body = createCard(autoPage, "Quest & Farm", 1)
     createToggle(body, "Money Grind", 3, function() return State.Grind end, function(v)
@@ -3496,7 +3519,7 @@ do
             table.clear(visited)
             table.clear(Config.Quest.Selected)
             for _, n in ipairs(Config.Bosses) do
-                if questRemote(n) then
+                if T3.inMap(n) then
                     Config.Quest.Selected[n] = true
                 end
             end
@@ -3690,7 +3713,7 @@ do
         local row = rows[name]
         if not row then return end
         local picked = Config.Quest.Selected[name] == true
-        local inMap = questRemote(name) ~= nil
+        local inMap = T3.inMap(name)
         row.Text = (picked and "  [x]  " or "  [  ]  ") .. name
         row.BackgroundColor3 = picked and Theme.Picked or Theme.Surface
         row.TextColor3 = inMap and Theme.Text or Theme.TextMuted
@@ -3716,7 +3739,7 @@ do
     smallBtn("This Map", function()
         table.clear(Config.Quest.Selected)
         for _, n in ipairs(Config.Bosses) do
-            if questRemote(n) then Config.Quest.Selected[n] = true end
+            if T3.inMap(n) then Config.Quest.Selected[n] = true end
         end
         renderAll()
     end)
