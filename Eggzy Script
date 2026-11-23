@@ -62,7 +62,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.80-mentor",
+    BuildNote = "v1.7.83-mentor",
     Debug = true,
     PanicKey = Enum.KeyCode.End,
     ToggleKey = Enum.KeyCode.RightShift,
@@ -168,7 +168,8 @@ local Config = {
             Poll          = 0.1,
         },
         Training5 = {                    -- quest 5: mentor fight in the other server
-            Depth        = 60,          -- was 90 (your first ask); 60 because the boss fell through the map at 90. 60 is my pick, uncalibrated; same distance the grind uses for some bosses
+            QPeriod      = 5,           -- from you: press Q every 5 seconds while the boss is alive
+            Offset       = 30,          -- from you: 30 studs ABOVE the boss (positive = above, negative = under; it was 90 then 60 under)
             BossFolder   = "npc",       -- ASSUMED: same folder the grind uses; unverified in the mentor-fight server (falls back to Workspace children)
             TeleportWait = 60,          -- seconds to wait for the server teleport after talking before talking again (uncalibrated)
             ResumeFile   = "EggzyResume.txt", -- flag file written when the fight-server teleport is expected; survives the teleport
@@ -2250,48 +2251,58 @@ function T3.fight()
 
     State.Fly = true
     State.Noclip = true
+    State.Kill = true
     startFly()
     T3.startAimUp()
 
     local ok, result = pcall(function()
         local deadline = os.clock() + t.BossTimeout
-        local aliveSince = nil
+        local aliveSince, lastQ, sawBoss = nil, 0, false
         while stillOn() and os.clock() < deadline do
-            -- fly and noclip must stay on the whole fight: re-assert every loop (a respawn or the game can reset them)
+            -- fly, noclip and Instant Kill must stay on the whole fight: re-assert every loop
             State.Fly = true
             State.Noclip = true
+            State.Kill = true -- Instant Kill toggle (hits models in Workspace.npc within Config.Kill.Range)
             if not (flyBV and flyBV.Parent) then startFly() end
+
             local model, hum, part = T3.findFightBoss(mentorName)
             if model then
-                MentorInfo.phase = string.format("t5 under %s (hp %.0f)", model.Name, hum.Health)
-                placeUnder(part, -t.Depth)
-                if hum.Health > 0 then
+                sawBoss = true
+                -- dead = gone from the world, or died by itself (a Health 0 that WE wrote does not count)
+                if not model.Parent or (hum.Health <= 0 and not scriptZeroed[hum]) then
+                    return string.format("boss %s is dead", model.Name)
+                end
+                MentorInfo.phase = string.format("t5 %s %s (hp %.0f)", t.Offset >= 0 and "above" or "under", model.Name, hum.Health)
+                placeUnder(part, t.Offset)
+                if isLiving(hum) then
                     aliveSince = aliveSince or os.clock()
+                    -- from you: press Q every 5 seconds while the boss is alive
+                    if os.clock() - lastQ >= t.QPeriod then
+                        lastQ = os.clock()
+                        pressKey(g.Key, g.KeyHold)
+                    end
+                    if os.clock() - aliveSince >= t.AliveConfirm and hum.Health > 0 then
+                        scriptZeroed[hum] = true
+                        pcall(function() hum.Health = 0 end)
+                    end
                 else
                     aliveSince = nil
                 end
-                if aliveSince and os.clock() - aliveSince >= t.AliveConfirm then
-                    local killUntil = os.clock() + g.KillSeconds
-                    while stillOn() and os.clock() < killUntil and model.Parent and hum.Health > 0 do
-                        placeUnder(part, -t.Depth)
-                        scriptZeroed[hum] = true
-                        pcall(function() hum.Health = 0 end)
-                        task.wait(g.KillStep)
-                    end
-                    return string.format("hp set to 0 on %s (hp now %.0f)", model.Name, hum.Health)
-                end
             else
+                if sawBoss then return "boss model is gone" end
                 aliveSince = nil
                 MentorInfo.phase = "t5 waiting for boss"
+                -- boss not there yet: keep pressing Q until it shows up
+                pressKey(g.Key, g.KeyHold)
+                task.wait(g.KeyDelay)
             end
-            pressKey(g.Key, g.KeyHold)
-            task.wait(g.KeyDelay)
+            task.wait(g.KillStep)
         end
-        return "no living boss confirmed before timeout or stop"
+        return "boss still alive at timeout, or stopped"
     end)
 
     T3.stopAim()
-    -- Flight and noclip are left ON after the fight (you said they must be on); turn them off in the Player page.
+    -- Flight, noclip and Instant Kill are left ON after the fight (you said they must be on); turn them off in the Player page.
     return ok, tostring(result)
 end
 
