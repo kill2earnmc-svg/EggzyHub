@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.116-noink",
+    BuildNote = "v1.7.119-maxlvlpres",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 116 },
+    Version = { Tweaks = 119 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3840,9 +3840,9 @@ do
 end
 
 do
-    -- Rank Up: LocalPlayer.startevent:FireServer("rankup") (captured with WrenchSpy). Pure remote call: it never moves the player.
+    -- Rank Up: LocalPlayer.startevent:FireServer("maxlvlpres") (the real rank-up call, captured with WrenchSpy; "rankup" only reset stats). Pure remote call: it never moves the player.
     -- Interval is an ASSUMED pause between automatic fires; the game's own cooldown is not known.
-    Config.RankUp = { Interval = 5 }
+    Config.RankUp = { Interval = 5, Arg = "maxlvlpres" }
     local RK = { lastFire = 0 }
 
     function RK.fire()
@@ -3851,7 +3851,7 @@ do
             print("[EggzyRank] LocalPlayer.startevent not found")
             return false
         end
-        local okFire, err = pcall(function() remote:FireServer("rankup") end)
+        local okFire, err = pcall(function() remote:FireServer(Config.RankUp.Arg) end)
         if not okFire then
             print("[EggzyRank] fire failed: " .. tostring(err))
             return false
@@ -4062,6 +4062,101 @@ do
     createToggle(body, "ESP Boss NPCs", 3, function() return State.ESP.BossNPCESP end, function(v)
         State.ESP.BossNPCESP = v
     end)
+end
+
+createNavButton("Misc", 6, "✦")
+local miscPage = createPage("Misc")
+
+-- Teleport to Player: one row per other player in the server (kept live on join/leave); clicking a row moves you next to that player's root part.
+Config.PlayerTP = { Offset = CFrame.new(0, 0, 4), ListHeight = 200 } -- Offset is relative to the target's root part (4 studs along its Z axis), an assumption
+
+function T3.tpToPlayer(plr)
+    if not plr or plr == LocalPlayer or plr.Parent ~= Players then return false, "player left" end
+    local myRoot = getRoot()
+    if not myRoot then return false, "no character" end
+    local tChar = plr.Character
+    local tRoot = tChar and tChar:FindFirstChild("HumanoidRootPart")
+    if not tRoot then return false, "target has no character" end
+    local cf = tRoot.CFrame * Config.PlayerTP.Offset
+    local p = cf.Position
+    if p.X ~= p.X or p.Y ~= p.Y or p.Z ~= p.Z or math.abs(p.X) > 1e7 or math.abs(p.Y) > 1e7 or math.abs(p.Z) > 1e7 then
+        return false, "target position invalid"
+    end
+    myRoot.AssemblyLinearVelocity = Vector3.zero
+    myRoot.AssemblyAngularVelocity = Vector3.zero
+    myRoot.CFrame = cf
+    return true
+end
+
+do
+    local card, body = createCard(miscPage, "Teleport to Player", 1)
+
+    local hint = Instance.new("TextLabel")
+    hint.Size = UDim2.new(1, 0, 0, 22)
+    hint.BackgroundTransparency = 1
+    hint.Text = "Click a player to teleport next to them"
+    hint.TextColor3 = Theme.TextDim
+    hint.Font = Enum.Font.Gotham
+    hint.TextSize = 11
+    hint.TextXAlignment = Enum.TextXAlignment.Left
+    hint.LayoutOrder = 0
+    hint.Parent = body
+
+    local list = Instance.new("ScrollingFrame")
+    list.Name = "PlayerList"
+    list.Size = UDim2.new(1, 0, 0, Config.PlayerTP.ListHeight)
+    list.BackgroundColor3 = Theme.Surface
+    list.BackgroundTransparency = 0.3
+    list.BorderSizePixel = 0
+    list.ScrollBarThickness = 3
+    list.ScrollBarImageColor3 = Theme.Accent
+    list.CanvasSize = UDim2.new()
+    list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    list.LayoutOrder = 1
+    list.Parent = body
+    Instance.new("UICorner", list).CornerRadius = UDim.new(0, 6)
+
+    local listPad = Instance.new("UIPadding", list)
+    listPad.PaddingTop = UDim.new(0, 4)
+    listPad.PaddingBottom = UDim.new(0, 4)
+    listPad.PaddingLeft = UDim.new(0, 4)
+    listPad.PaddingRight = UDim.new(0, 4)
+    local listLayout = Instance.new("UIListLayout", list)
+    listLayout.Padding = UDim.new(0, 2)
+    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local rows = {}
+
+    local function addRow(plr)
+        if plr == LocalPlayer or rows[plr] then return end
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, 0, 0, 24)
+        b.BackgroundColor3 = Theme.Surface
+        b.Text = string.format("  %s  (@%s)", plr.DisplayName, plr.Name)
+        b.TextColor3 = Theme.Text
+        b.Font = Enum.Font.Gotham
+        b.TextSize = 12
+        b.TextXAlignment = Enum.TextXAlignment.Left
+        b.AutoButtonColor = false
+        b.BorderSizePixel = 0
+        b.LayoutOrder = 0
+        b.Parent = list
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+        b.MouseEnter:Connect(function() b.BackgroundColor3 = Theme.SurfaceHover end)
+        b.MouseLeave:Connect(function() b.BackgroundColor3 = Theme.Surface end)
+        b.MouseButton1Click:Connect(function()
+            local ok, why = T3.tpToPlayer(plr)
+            if not ok then print("[EggzyTP] " .. plr.Name .. ": " .. tostring(why)) end
+        end)
+        rows[plr] = b
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do addRow(plr) end
+    track(Players.PlayerAdded:Connect(addRow))
+    track(Players.PlayerRemoving:Connect(function(plr)
+        local b = rows[plr]
+        if b then b:Destroy() rows[plr] = nil end
+    end))
 end
 
 setPage("Home")
