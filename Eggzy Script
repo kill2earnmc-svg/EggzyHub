@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.129-bossrounds",
+    BuildNote = "v1.7.155-nohitbox",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 129 },
+    Version = { Tweaks = 155 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -634,7 +634,28 @@ local heldKeys = {}
 local pressing = false -- false, or the os.clock() when an input routine started; older than 5 s counts as stale (a routine that died mid-press must not block input forever)
 local mouseHeld = false
 
-local function sendKey(down, keyCode)
+-- WrenchKeyTest on this game: VirtualInputManager and VirtualUser key presses were NOT seen by the game, keypress/keyrelease were. A press asked for
+-- with real = true goes through keypress/keyrelease (letters, digits and space only, Windows virtual-key = uppercase ASCII); everything else is unchanged.
+local realHeld = {}
+local function virtualKeyFor(keyCode)
+    local v = keyCode.Value
+    if v >= 97 and v <= 122 then return v - 32 end
+    if v == 32 or (v >= 48 and v <= 57) then return v end
+    return nil
+end
+local function sendKey(down, keyCode, real)
+    if type(keypress) == "function" and type(keyrelease) == "function" then
+        local vk = virtualKeyFor(keyCode)
+        if vk and down and real then
+            realHeld[keyCode] = true
+            keypress(vk)
+            return
+        elseif vk and not down and realHeld[keyCode] then
+            realHeld[keyCode] = nil
+            keyrelease(vk)
+            return
+        end
+    end
     if okVim and VIM then
         VIM:SendKeyEvent(down, keyCode, false, game)
     elseif down then
@@ -1023,11 +1044,11 @@ local function placeUnder(part, height)
     return true
 end
 
-local function pressKey(keyCode, hold)
+local function pressKey(keyCode, hold, real)
     if pressing and os.clock() - pressing < 5 then return end
     pressing = os.clock()
     heldKeys[keyCode] = true
-    if pcall(sendKey, true, keyCode) then
+    if pcall(sendKey, true, keyCode, real) then
         task.wait(hold)
     end
     if heldKeys[keyCode] then
@@ -2227,7 +2248,7 @@ function T3.bindAim()
     T3.aimBound = true
     RunService:BindToRenderStep(T3_BIND, Enum.RenderPriority.Camera.Value + 1, function()
         local cam = Workspace.CurrentCamera
-        if not (Alive and State.Mentor and cam) then return end
+        if not (Alive and (State.Mentor or T3.aimForce) and cam) then return end
         local camPos = cam.CFrame.Position
         if T3.aimUp then
             cam.CFrame = CFrame.lookAt(camPos, camPos + (T3.aimDir or Vector3.yAxis), Vector3.zAxis)
@@ -4164,6 +4185,18 @@ do
         -- (the field bosses do) or its MaxHealth is at least HpFactor times the median MaxHealth of the npcs around (needs 3+ npcs). Names still count too.
         StructureDetect = true,
         HpFactor = 5, -- ASSUMED multiplier
+        -- Your report: the Instant Kill only works on the boss in dungeons, so mobs need real damage. While a mob is in range the aura now also presses
+        -- M1 every pass and Q every QPeriod seconds (real inputs, like Money Grind). UNTESTED on dungeon mobs; the reach of M1/Q is not known, and the hub does not move you.
+        -- Teleport above the current target (boss first, otherwise the nearest mob) every pass and look down at it. Height is ASSUMED.
+        -- Boss: you hover ABOVE it and look down. Mobs: you hover UNDER them and look up. Both distances are ASSUMED.
+        Approach = { BossAbove = 6, MobUnder = 50 },
+        -- MoveKey = the move you equipped by hand (V on the Ice bloodline). Pressed every MovePeriod seconds while "Spam V move" is on; the game's own
+        -- cooldown still applies, because how to remove it is not known (see the reply for what is needed). Equipping the bloodline/move is not built either.
+        Attack = { Enabled = true, M1 = false, M1Hold = 0.05, QKey = Enum.KeyCode.Q, QHold = 0.05, QPeriod = 5,
+                   MoveKey = Enum.KeyCode.V, MoveHold = 0.2, MovePeriod = 0.3 }, -- your log: the game saw V held for about 0.13 s (key v then vend), so 0.05 s was probably too short
+        -- Chi charge: when combat.stamina falls to Threshold or below, the moves stop and the charge key is HELD until stamina is back near its highest
+        -- value seen (StopFraction of it, ASSUMED 0.95). Key = UNSET: which key charges chi was not given (set it as an Enum.KeyCode); the toggle is GATED until then.
+        Charge = { Key = nil, Threshold = 30000, StopFraction = 0.95 },
         AuraRange = 300,      -- studs, ASSUMED kill-aura reach (the hub's Instant Kill uses 120)
         Interval = 0.25,
     }
@@ -4171,19 +4204,54 @@ do
         Config.Dungeons.EnterArg[name] = "dungeon" .. i
     end
     State.AutoDungeon = false
+    State.DungeonTP = true
+    State.DungeonBossOnly = false
+    State.DungeonMove = true
+    State.DungeonAllMoves = false
+    State.DungeonCharge = true
+    -- Move cooldowns, from your WrenchMoveWatch log: Players.<you>.statz.keys.<key>.cooldown is a number value that jumped 0 -> 20 when V was cast and
+    -- then counted down by 1 per second (the casting also dropped combat.stamina by 30000). The toggle writes 0 into every statz.keys.*.cooldown on this
+    -- client every 0.05 s. UNVERIFIED: the count-down looked server driven, so the server may still enforce its own cooldown.
+    State.NoCooldown = true -- ON by default now; it is zeroed every frame (before: every 0.05 s)
+    track(RunService.RenderStepped:Connect(function()
+        if not State.NoCooldown then return end
+        local statz = LocalPlayer:FindFirstChild("statz")
+        local keys = statz and statz:FindFirstChild("keys")
+        if keys then
+            for _, k in ipairs(keys:GetChildren()) do
+                local cd = k:FindFirstChild("cooldown")
+                if cd and cd:IsA("ValueBase") and cd.Value ~= 0 then
+                    pcall(function() cd.Value = 0 end)
+                end
+            end
+        end
+    end))
     State.Dungeon = Config.Dungeons.List[1]
-    local DG = { status = "off", bossSeen = false, bossDone = false, warned = {}, seen = setmetatable({}, { __mode = "k" }), kills = 0 }
+    local DG = { charging = false, maxStamina = 0, moveIndex = 0, casts = 0, lastDK = false, hold = nil, vSent = 0, noclipByUs = false, lastMove = 0, sent = 0, engaged = false, flyByUs = false, lastQ = 0, status = "off", bossSeen = false, bossDone = false, warned = {}, seen = setmetatable({}, { __mode = "k" }), kills = 0 }
+
+    -- hold the chosen position and orientation EVERY frame (the pass above only runs every 0.25 s, and the game/flight code was undoing it in between)
+    track(RunService.RenderStepped:Connect(function()
+        if not (State.AutoDungeon and State.DungeonTP and DG.engaged and DG.hold) then return end
+        local root = getRoot()
+        if not root then return end
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = DG.hold
+    end))
 
     local function dungeonBossNames()
         return Config.Dungeons.Bosses[State.Dungeon] or {}
     end
 
-    local function killModel(h, part)
+    -- zero = also set Health to 0 on this client (the Instant Kill trick, which only works on the boss). Mobs are NOT zeroed: that would hide
+    -- them from the loop while they are still alive on the server.
+    local function killModel(h, part, zero)
         local r = Config.Kill.UseHitRemote and LocalPlayer:FindFirstChild(Config.Kill.RemoteName)
         if r and r:IsA("BaseRemoteEvent") then
             pcall(r.FireServer, r, "target", part)
+            DG.sent += 1
         end
-        if h.Health > 0 then
+        if zero and h.Health > 0 then
             scriptZeroed[h] = true
             pcall(function()
                 h.Health = 0
@@ -4196,6 +4264,29 @@ do
     task.spawn(function()
         while Alive do
             task.wait(Config.Dungeons.Interval)
+            if DG.engaged and not (State.AutoDungeon and State.DungeonTP) then
+                -- undo what the teleport mode switched on: camera aim, and flight if it was this feature that started it
+                DG.engaged = false
+                T3.aimForce = false
+                DG.hold = nil
+                local _, hum0 = getRoot()
+                if hum0 then pcall(function() hum0.AutoRotate = true end) end
+                pcall(T3.stopAim)
+                if DG.noclipByUs then
+                    DG.noclipByUs = false
+                    State.Noclip = false
+                end
+                if DG.flyByUs then
+                    DG.flyByUs = false
+                    State.Fly = false
+                    pcall(stopFly)
+                end
+            end
+            if not State.AutoDungeon and DG.charging then
+                DG.charging = false
+                local k = Config.Dungeons.Charge.Key
+                if k then heldKeys[k] = nil pcall(sendKey, false, k) end
+            end
             if not State.AutoDungeon then
                 DG.status = "off"
                 DG.bossSeen, DG.bossDone, DG.kills = false, false, 0
@@ -4213,7 +4304,8 @@ do
                         DG.warned[State.Dungeon] = true
                         print("[EggzyDungeon] no boss names set for " .. tostring(State.Dungeon) .. " (Config.Dungeons.Bosses), killing mobs only")
                     end
-                    local killed, bossAlive = 0, false
+                    local killed, bossAlive, mobNear = 0, false, false
+                    local bestBoss, bestBossD, bestMob, bestMobD, tgtHum = nil, math.huge, nil, math.huge, nil
                     local median
                     if Config.Dungeons.StructureDetect then
                         local hps = {}
@@ -4250,13 +4342,101 @@ do
                                         DG.seen[m] = true
                                         print("[EggzyDungeon] boss spawned: " .. tostring(m:FindFirstChild("npctype") and m.npctype.Value or m.Name) .. string.format(" (hp %.0f)", h.MaxHealth))
                                     end
-                                    killModel(h, part)
+                                    killModel(h, part, true)
                                     killed += 1
-                                elseif h.Health > 0 and (part.Position - root.Position).Magnitude <= Config.Dungeons.AuraRange then
-                                    killModel(h, part)
-                                    killed += 1
+                                    local bd = (part.Position - root.Position).Magnitude
+                                    if bd < bestBossD then bestBoss, bestBossD, tgtHum = part, bd, h end
+                                elseif h.Health > 0 and not State.DungeonBossOnly then
+                                    local md = (part.Position - root.Position).Magnitude
+                                    if State.DungeonTP or md <= Config.Dungeons.AuraRange then
+                                        mobNear = true
+                                        killModel(h, part, false)
+                                        killed += 1
+                                        if md < bestMobD then bestMob, bestMobD = part, md if not bestBoss then tgtHum = h end end
+                                    end
                                 end
                             end
+                        end
+                    end
+                    local target = bestBoss or bestMob
+                    if State.DungeonTP and target and target.Parent then
+                        local tp = target.Position
+                        if tp.X == tp.X and tp.Y == tp.Y and tp.Z == tp.Z and math.abs(tp.X) < 1e7 and math.abs(tp.Y) < 1e7 and math.abs(tp.Z) < 1e7 then
+                            root.AssemblyLinearVelocity = Vector3.zero
+                            root.AssemblyAngularVelocity = Vector3.zero
+                            local onBoss = bestBoss ~= nil
+                            local offset = onBoss and Config.Dungeons.Approach.BossAbove or -Config.Dungeons.Approach.MobUnder
+                            -- explicit up vector: looking straight up/down is parallel to the default up axis, which made the orientation undefined
+                            local cf = CFrame.lookAt(tp + Vector3.new(0, offset, 0), tp, Vector3.zAxis)
+                            DG.hold = cf
+                            root.CFrame = cf
+                            -- flying and looking straight down while we hover over it
+                            if not DG.engaged then
+                                DG.engaged = true
+                                DG.flyByUs = not State.Fly
+                                DG.noclipByUs = not State.Noclip
+                                T3.aimForce = true -- the aim hook otherwise only runs while Auto Mentor is on
+                                local _, hum1 = getRoot()
+                                if hum1 then pcall(function() hum1.AutoRotate = false end) end
+                                T3.startAimUp(-Vector3.yAxis)
+                            end
+                            State.Noclip = true
+                            T3.aimDir = onBoss and -Vector3.yAxis or Vector3.yAxis
+                            if not State.Fly then State.Fly = true end
+                            -- NOT startFly(): it calls stopFly(), which force-releases every held key, so V was let go right after it was pressed
+                            if not (flyBV and flyBV.Parent == root) then ensureFlyMovers(root, select(2, getRoot())) end
+                        end
+                    end
+                    do
+                        local ch = Config.Dungeons.Charge
+                        local combat = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("combat")
+                        local st = combat and combat:FindFirstChild("stamina")
+                        local stamina = st and st:IsA("ValueBase") and tonumber(st.Value) or nil
+                        if stamina and stamina > DG.maxStamina then DG.maxStamina = stamina end
+                        if State.DungeonCharge and ch.Key and stamina then
+                            if not DG.charging and stamina <= ch.Threshold then
+                                DG.charging = true
+                                heldKeys[ch.Key] = true
+                                pcall(sendKey, true, ch.Key, true)
+                            elseif DG.charging and stamina >= DG.maxStamina * ch.StopFraction then
+                                DG.charging = false
+                                heldKeys[ch.Key] = nil
+                                pcall(sendKey, false, ch.Key)
+                            end
+                        elseif DG.charging then
+                            DG.charging = false
+                            if ch.Key then heldKeys[ch.Key] = nil pcall(sendKey, false, ch.Key) end
+                        end
+                    end
+                    local atk = Config.Dungeons.Attack
+                    if atk.Enabled and not DG.charging and (mobNear or bossAlive) and UserInputService:GetFocusedTextBox() == nil then
+                        if atk.M1 then task.spawn(clickM1, atk.M1Hold) end -- punching is OFF by default (it got in the way of the move)
+                        if State.DungeonMove and os.clock() - DG.lastMove >= atk.MovePeriod then
+                            DG.lastMove = os.clock()
+                            DG.vSent += 1
+                            local key = atk.MoveKey
+                            if State.DungeonAllMoves then
+                                -- every move key the game lists under statz.keys (each move has its own cooldown), one per press, round robin
+                                local statz = LocalPlayer:FindFirstChild("statz")
+                                local kf = statz and statz:FindFirstChild("keys")
+                                local list = {}
+                                if kf then
+                                    for _, k in ipairs(kf:GetChildren()) do
+                                        local ok, code = pcall(function() return Enum.KeyCode[k.Name:upper()] end)
+                                        if ok and code then list[#list + 1] = code end
+                                    end
+                                    table.sort(list, function(a, b) return a.Value < b.Value end)
+                                end
+                                if #list > 0 then
+                                    DG.moveIndex = DG.moveIndex % #list + 1
+                                    key = list[DG.moveIndex]
+                                end
+                            end
+                            task.spawn(pressKey, key, atk.MoveHold, true) -- real = keypress/keyrelease (the only way the game saw V in your key test)
+                        end
+                        if not State.DungeonMove and os.clock() - DG.lastQ >= atk.QPeriod then -- with Spam V on, V is the only thing pressed
+                            DG.lastQ = os.clock()
+                            task.spawn(pressKey, atk.QKey, atk.QHold)
                         end
                     end
                     if DG.bossSeen and not bossAlive and not DG.bossDone then
@@ -4270,6 +4450,26 @@ do
                         DG.status = "boss alive, killing it"
                     else
                         DG.status = string.format("aura on, %d hit this pass", killed)
+                    end
+                    do
+                        local cam = Workspace.CurrentCamera
+                        local combat = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("combat")
+                        local dis = combat and combat:FindFirstChild("disable")
+                        local diskeys = combat and combat:FindFirstChild("disablekeys")
+                        local _, hum2 = getRoot()
+                        local dkNow = diskeys and diskeys.Value == true
+                        if dkNow and not DG.lastDK then DG.casts += 1 end -- a cast shows as disablekeys turning true (your move log)
+                        DG.lastDK = dkNow
+                        local statz = LocalPlayer:FindFirstChild("statz")
+                        local vcd = statz and statz:FindFirstChild("keys") and statz.keys:FindFirstChild("v") and statz.keys.v:FindFirstChild("cooldown")
+                        DG.status = string.format("%s | V sent %d, casts seen %d, v cooldown=%s, camera up=%.2f, disable=%s disablekeys=%s platformStand=%s", DG.status, DG.vSent,
+                            DG.casts, vcd and tostring(vcd.Value) or "-",
+                            cam and cam.CFrame.LookVector.Y or 0, dis and tostring(dis.Value) or "-", diskeys and tostring(diskeys.Value) or "-",
+                            hum2 and tostring(hum2.PlatformStand) or "-")
+                    end
+                    if tgtHum and not DG.bossDone then
+                        DG.status = string.format("%s | target hp %.0f/%.0f, %.0f studs, hits sent %d", DG.status, tgtHum.Health, tgtHum.MaxHealth,
+                            math.min(bestBossD, bestMobD), DG.sent)
                     end
                 end
             end
@@ -4374,11 +4574,55 @@ do
     end
     enterBtn.MouseButton1Click:Connect(DG.enter)
 
-    createToggle(body, "Auto Dungeon (kill aura + boss check)", 4, function() return State.AutoDungeon end, function(v)
+    local inBtn = Instance.new("TextButton")
+    inBtn.Name = "InDungeonAlready"
+    inBtn.Size = UDim2.new(1, 0, 0, 32)
+    inBtn.BackgroundColor3 = Theme.Off
+    inBtn.BorderSizePixel = 0
+    inBtn.Text = "In dungeon already"
+    inBtn.TextColor3 = Theme.Text
+    inBtn.Font = Enum.Font.GothamMedium
+    inBtn.TextSize = 12
+    inBtn.AutoButtonColor = true
+    inBtn.LayoutOrder = 4
+    inBtn.Parent = body
+    Instance.new("UICorner", inBtn).CornerRadius = UDim.new(0, 7)
+    -- starts the killing without entering anything (does not fire the enter remote)
+    inBtn.MouseButton1Click:Connect(function()
+        DG.bossSeen, DG.bossDone, DG.kills = false, false, 0
+        State.AutoDungeon = true
+    end)
+
+    createToggle(body, "Auto Dungeon (kill aura + boss check)", 5, function() return State.AutoDungeon end, function(v)
         State.AutoDungeon = v
         DG.bossSeen, DG.bossDone, DG.kills = false, false, 0
     end)
 
+    createToggle(body, "Bosses only (ignore mobs)", 6, function() return State.DungeonBossOnly end, function(v)
+        State.DungeonBossOnly = v
+    end)
+    createToggle(body, "Teleport above targets", 7, function() return State.DungeonTP end, function(v)
+        State.DungeonTP = v
+    end)
+
+    createValueRow(body, "Above boss (studs)", function() return Config.Dungeons.Approach.BossAbove end, function(v)
+        Config.Dungeons.Approach.BossAbove = v
+    end, 2, 2, 100, 8)
+    createValueRow(body, "Under mobs (studs)", function() return Config.Dungeons.Approach.MobUnder end, function(v)
+        Config.Dungeons.Approach.MobUnder = v
+    end, 2, 2, 100, 9)
+    createToggle(body, "Spam V move (equip it first)", 10, function() return State.DungeonMove end, function(v)
+        State.DungeonMove = v
+    end)
+    createToggle(body, "Charge chi when low (<= 30k)", 11, function() return State.DungeonCharge end, function(v)
+        State.DungeonCharge = v
+    end, function() return Config.Dungeons.Charge.Key == nil end)
+    createToggle(body, "Spam ALL equipped moves (not only V)", 12, function() return State.DungeonAllMoves end, function(v)
+        State.DungeonAllMoves = v
+    end)
+    createToggle(body, "Remove move cooldowns", 13, function() return State.NoCooldown end, function(v)
+        State.NoCooldown = v
+    end)
     local statusLabel = Instance.new("TextLabel")
     statusLabel.Size = UDim2.new(1, 0, 0, 22)
     statusLabel.BackgroundTransparency = 1
@@ -4387,13 +4631,31 @@ do
     statusLabel.Font = Enum.Font.Gotham
     statusLabel.TextSize = 11
     statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-    statusLabel.LayoutOrder = 5
+    statusLabel.LayoutOrder = 16
     statusLabel.Parent = body
     task.spawn(function()
         while Alive do
             statusLabel.Text = "Status: " .. DG.status
             task.wait(0.3)
         end
+    end)
+
+    local copyBtn = Instance.new("TextButton")
+    copyBtn.Size = UDim2.new(1, 0, 0, 28)
+    copyBtn.BackgroundColor3 = Theme.Off
+    copyBtn.BorderSizePixel = 0
+    copyBtn.Text = "Copy status line"
+    copyBtn.TextColor3 = Theme.Text
+    copyBtn.Font = Enum.Font.GothamMedium
+    copyBtn.TextSize = 12
+    copyBtn.AutoButtonColor = true
+    copyBtn.LayoutOrder = 17
+    copyBtn.Parent = body
+    Instance.new("UICorner", copyBtn).CornerRadius = UDim.new(0, 7)
+    copyBtn.MouseButton1Click:Connect(function()
+        local text = "[EggzyDungeon] " .. tostring(DG.status)
+        print(text)
+        pcall(function() if setclipboard then setclipboard(text) end end)
     end)
 
     local dumpBtn = Instance.new("TextButton")
@@ -4405,7 +4667,7 @@ do
     dumpBtn.Font = Enum.Font.GothamMedium
     dumpBtn.TextSize = 12
     dumpBtn.AutoButtonColor = true
-    dumpBtn.LayoutOrder = 6
+    dumpBtn.LayoutOrder = 18
     dumpBtn.Parent = body
     Instance.new("UICorner", dumpBtn).CornerRadius = UDim.new(0, 7)
     dumpBtn.MouseButton1Click:Connect(function()
