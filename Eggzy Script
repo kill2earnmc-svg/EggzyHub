@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.112-fbrender",
+    BuildNote = "v1.7.113-ink",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3608,6 +3608,7 @@ local autoPage = createPage("Auto")
 -- Note: it is a GUI image overlay, so fullbright raises the lighting but does not remove the overlay itself.
 Config.Blind = {
     GuiName = "inksplash",
+    InkTransparency = 0.7, -- how see-through the ink image is made (0 = solid, 1 = invisible); an assumption, change it in the Lighting card
     Detect = function()
         local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
         local ink = pg and pg:FindFirstChild(Config.Blind.GuiName)
@@ -3625,6 +3626,7 @@ Config.Fullbright = {
 }
 State.Fullbright = false
 State.BlindFB = false
+State.InkSeeThrough = false
 
 for key, value in pairs(Config.Fullbright.Lighting) do
     track(Lighting:GetPropertyChangedSignal(key):Connect(function()
@@ -3713,6 +3715,22 @@ function T3.blinded()
 end
 
 -- every frame, at the last render priority (after the game's own RenderStepped code), so the frame that is drawn already has our values
+-- The ink is the ScreenGui "inksplash" (an ImageLabel inside it). While it exists, push every image / frame in it to at least the chosen
+-- transparency each frame, at the last render priority, so the game's own fade-in is overridden. Nothing to restore: the gui is deleted by the game.
+function T3.inkApply()
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local ink = pg and pg:FindFirstChild(Config.Blind.GuiName)
+    if not ink then return end
+    local target = Config.Blind.InkTransparency
+    for _, d in ipairs(ink:GetDescendants()) do
+        if d:IsA("ImageLabel") or d:IsA("ImageButton") then
+            if d.ImageTransparency < target then d.ImageTransparency = target end
+        elseif d:IsA("Frame") then
+            if d.BackgroundTransparency < target then d.BackgroundTransparency = target end
+        end
+    end
+end
+
 T3.blindWas = false
 pcall(function() RunService:UnbindFromRenderStep("EggzyFullbright") end)
 RunService:BindToRenderStep("EggzyFullbright", Enum.RenderPriority.Last.Value, function()
@@ -3726,6 +3744,9 @@ RunService:BindToRenderStep("EggzyFullbright", Enum.RenderPriority.Last.Value, f
     else
         T3.fbRestore()
     end
+    if State.InkSeeThrough and blind then
+        pcall(T3.inkApply)
+    end
 end)
 
 -- Fullbright toggles live on the Player page (card order 3); they are created here because they need Config.Blind and T3.fb* defined above.
@@ -3737,6 +3758,12 @@ do
     createToggle(body, "Fullbright when blinded", 2, function() return State.BlindFB end, function(v)
         State.BlindFB = v
     end, function() return type(Config.Blind.Detect) ~= "function" end)
+    createToggle(body, "See-through ink splash", 3, function() return State.InkSeeThrough end, function(v)
+        State.InkSeeThrough = v
+    end)
+    createValueRow(body, "Ink transparency", function() return Config.Blind.InkTransparency end, function(v)
+        Config.Blind.InkTransparency = v
+    end, 0.1, 0, 1, 4)
 end
 
 -- Is this boss's mission really present in the current map? Strict: the mission folder must exist here and hold the giver remote.
