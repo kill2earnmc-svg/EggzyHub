@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.94-select",
+    BuildNote = "v1.7.95-select0",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3542,13 +3542,16 @@ do
         State.Mentor = v
         if not v then forceReleaseInputs() end
     end, function() return mentorMissionsFolder() == nil and Config.Mentor.Mission ~= 5 end)
-    createValueRow(body, "Start at training", function()
+    createValueRow(body, "Start at training (0 = all)", function()
+        if T3.all and Config.Mentor.Mission == 1 then return 0 end
         return math.min(Config.Mentor.Mission, 5)
     end, function(n)
+        T3.all = (n == 0)
+        n = math.max(n, 1)
         Config.Mentor.Mission = n
         T3.progress = n
         T3.saveProgress()
-    end, 1, 1, 5, 2)
+    end, 1, 0, 5, 2)
 
 end
 
