@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.105-unstick3",
+    BuildNote = "v1.7.106-nostick",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -1457,10 +1457,9 @@ end)
 -- If it stays true for DisableSeconds (UNCALIBRATED: the real length of the longest legitimate move is not known) while the hub is
 -- automating, set it back to false. Only that one value is touched.
 do
-    Config.Unstick = { Enabled = true, DisableSeconds = 8, StickSeconds = 4, Poll = 0.5 }
+    Config.Unstick = { Enabled = true, DisableSeconds = 8, Poll = 0.5 }
     task.spawn(function()
         local trackedValue, since = nil, nil
-        local stickSeen, stickSince = nil, nil
         while Alive do
             local u = Config.Unstick
             local hubBusy = State.Grind or State.AutoQuest or State.Mentor
@@ -1492,33 +1491,6 @@ do
                 trackedValue, since = nil, nil
             end
 
-            -- Second lock seen in the diff taken AFTER the first unstick: the character attribute "stickwall" is set, a BodyVelocity and
-            -- a BodyGyro sit in HumanoidRootPart (next to StickWallBodyVelocityMonitor) and the state is Freefall: the game's wall-stick
-            -- is still holding you (noclip means the wall contact that would end it never happens). Money Grind only: training 2 needs
-            -- the real stick for its tree jump. The hub's own fly movers (flyBV / flyBG) are never touched.
-            local stickVal = char and char:GetAttribute("stickwall")
-            if u.Enabled and State.Grind and stickVal ~= nil then
-                if stickVal ~= stickSeen then
-                    stickSeen, stickSince = stickVal, os.clock()
-                elseif os.clock() - stickSince >= u.StickSeconds then
-                    local removed = {}
-                    local rootS = char:FindFirstChild("HumanoidRootPart")
-                    if rootS then
-                        for _, d in ipairs(rootS:GetChildren()) do
-                            if (d:IsA("BodyVelocity") or d:IsA("BodyGyro")) and d ~= flyBV and d ~= flyBG then
-                                removed[#removed + 1] = d.ClassName
-                                pcall(function() d:Destroy() end)
-                            end
-                        end
-                    end
-                    pcall(function() char:SetAttribute("stickwall", nil) end)
-                    print(string.format("[EggzyUnstick] stickwall held for %.0fs: cleared the attribute, removed %s",
-                        os.clock() - stickSince, #removed > 0 and table.concat(removed, ", ") or "no movers"))
-                    stickSeen, stickSince = nil, nil
-                end
-            else
-                stickSeen, stickSince = nil, nil
-            end
             task.wait(u.Poll)
         end
     end)
