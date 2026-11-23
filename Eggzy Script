@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.99-qwatch",
+    BuildNote = "v1.7.100-qreset",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -106,6 +106,7 @@ local Config = {
         SpamPeriod = 5,
         SpamHold = 0.05,
         SpamFirstDelay = 1.0,
+        ResetOnStall = true,  -- you reset by hand when Q dies; this does the same after the stall has lasted two watchdog rounds (about 25 s)
     },
     Bosses = BossNames,
     ESP = {
@@ -1399,6 +1400,7 @@ task.spawn(function()
                     pressKey(cfg.SpamKey, cfg.SpamHold)
                     nextPress = os.clock() + cfg.SpamPeriod
                     cfg.lastPress = os.clock()
+                    cfg.stalls = 0
                 end
             end
         end
@@ -1415,6 +1417,19 @@ task.spawn(function()
                     pressing and string.format("%.1fs", os.clock() - pressing) or "no",
                     tostring(next(heldKeys) ~= nil), tostring(partD ~= nil),
                     distD and string.format("%.0f", distD) or "?", tostring(cfg.SpamRange)))
+                local _, humD = getRoot()
+                if humD then
+                    print(string.format("[EggzyQ] character: state=%s platformStand=%s walkSpeed=%s health=%.0f/%.0f sit=%s",
+                        tostring(humD:GetState()), tostring(humD.PlatformStand), tostring(humD.WalkSpeed),
+                        humD.Health, humD.MaxHealth, tostring(humD.Sit)))
+                    local char = humD.Parent
+                    local attrs = {}
+                    if char then
+                        for k, v in pairs(char:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. tostring(v) end
+                    end
+                    for k, v in pairs(LocalPlayer:GetAttributes()) do attrs[#attrs + 1] = "player." .. k .. "=" .. tostring(v) end
+                    print("[EggzyQ] attributes: " .. (#attrs > 0 and table.concat(attrs, ", ") or "none"))
+                end
                 forceReleaseInputs()
                 pressing = false
                 windowFocused = true
@@ -1423,6 +1438,15 @@ task.spawn(function()
                     if tb then tb:ReleaseFocus() end
                 end)
                 nextPress = 0
+                cfg.stalls = (cfg.stalls or 0) + 1
+                if cfg.ResetOnStall and cfg.stalls >= 2 and humD then
+                    print("[EggzyQ] still stalled: resetting the character (same as your manual reset)")
+                    cfg.stalls = 0
+                    pcall(function()
+                        humD.Health = 0
+                        if humD.Parent then humD.Parent:BreakJoints() end
+                    end)
+                end
             end
         end
         task.wait(0.2)
