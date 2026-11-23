@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.120-autostats",
+    BuildNote = "v1.7.121-statpriority",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 120 },
+    Version = { Tweaks = 121 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3893,12 +3893,29 @@ end
 
 do
     -- Auto Stats: LocalPlayer.startevent:FireServer("addstat", <stat>, 1), captured with WrenchSpy for chakra, ninjutsu, taijutsu, health.
-    -- Pure remote call, never moves the player. Where the unspent point count lives is NOT known, so it fires on a timer; the server decides
-    -- whether a point is available. Interval is an ASSUMED pause between fires. Stats outside the four captured ones are not offered.
-    Config.Stats = { Names = { "chakra", "ninjutsu", "taijutsu", "health" }, Amount = 1, Interval = 0.3 }
+    -- Pure remote call, never moves the player. Where the unspent point count and the current stat values live is NOT known, so the hub
+    -- cannot read them: each stat has a TARGET of points to send, and the hub counts the points it has SENT (not confirmed by the server).
+    -- Priority is the row order (top first): a stat is filled up to its target before the next one starts. Interval is an ASSUMED pause.
+    Config.Stats = {
+        Order = { "chakra", "ninjutsu", "taijutsu", "health" }, -- top = first priority; reordered by dragging the rows
+        Amount = 1,
+        Interval = 0.3,
+        MaxTarget = 100000,
+        RowHeight = 32,
+        RowGap = 4,
+    }
     State.AutoStats = false
-    State.StatPick = {}
-    local ST = { index = 0, lastFire = 0 }
+    local ST = { lastFire = 0, target = {}, sent = {}, labels = {}, done = false }
+    for _, name in ipairs(Config.Stats.Order) do
+        ST.target[name] = 0
+        ST.sent[name] = 0
+    end
+
+    function ST.refresh()
+        for name, label in pairs(ST.labels) do
+            label.Text = string.format("%d sent", ST.sent[name])
+        end
+    end
 
     function ST.fire(stat)
         local remote = LocalPlayer:FindFirstChild("startevent")
@@ -3914,13 +3931,10 @@ do
         return true
     end
 
-    -- next picked stat in round-robin order, nil when none is picked
+    -- first stat in priority order whose target is not reached yet, nil when everything is done
     function ST.nextStat()
-        local names = Config.Stats.Names
-        for _ = 1, #names do
-            ST.index = ST.index % #names + 1
-            local name = names[ST.index]
-            if State.StatPick[name] then return name end
+        for _, name in ipairs(Config.Stats.Order) do
+            if ST.sent[name] < ST.target[name] then return name end
         end
         return nil
     end
@@ -3930,8 +3944,15 @@ do
             if State.AutoStats and os.clock() - ST.lastFire >= Config.Stats.Interval then
                 local stat = ST.nextStat()
                 if stat then
-                    ST.fire(stat)
+                    ST.done = false
+                    if ST.fire(stat) then
+                        ST.sent[stat] += Config.Stats.Amount
+                        ST.refresh()
+                    end
                     ST.lastFire = os.clock()
+                elseif not ST.done then
+                    ST.done = true
+                    print("[EggzyStats] all targets reached")
                 end
             end
             task.wait(0.1)
@@ -3941,15 +3962,174 @@ do
     local card, body = createCard(autoPage, "Auto Stats", 5)
     createToggle(body, "Auto Stats", 1, function() return State.AutoStats end, function(v)
         State.AutoStats = v
+        ST.done = false
     end)
-    for i, name in ipairs(Config.Stats.Names) do
-        createToggle(body, "  " .. name:sub(1, 1):upper() .. name:sub(2), 1 + i, function() return State.StatPick[name] == true end, function(v)
-            State.StatPick[name] = v or nil
-        end)
+
+    local divider = Instance.new("Frame")
+    divider.Name = "Divider"
+    divider.Size = UDim2.new(1, 0, 0, 1)
+    divider.BackgroundColor3 = Theme.Border
+    divider.BackgroundTransparency = 0.3
+    divider.BorderSizePixel = 0
+    divider.LayoutOrder = 2
+    divider.Parent = body
+
+    local hint = Instance.new("TextLabel")
+    hint.Size = UDim2.new(1, 0, 0, 22)
+    hint.BackgroundTransparency = 1
+    hint.Text = "Drag a row by the grip: top = first priority. Type how many points you want in each stat (0 = skip)."
+    hint.TextColor3 = Theme.TextDim
+    hint.Font = Enum.Font.Gotham
+    hint.TextSize = 11
+    hint.TextWrapped = true
+    hint.AutomaticSize = Enum.AutomaticSize.Y
+    hint.Size = UDim2.new(1, 0, 0, 0)
+    hint.TextXAlignment = Enum.TextXAlignment.Left
+    hint.LayoutOrder = 3
+    hint.Parent = body
+
+    local rowH, gap = Config.Stats.RowHeight, Config.Stats.RowGap
+    local list = Instance.new("Frame")
+    list.Name = "StatList"
+    list.Size = UDim2.new(1, 0, 0, #Config.Stats.Order * (rowH + gap) - gap)
+    list.BackgroundTransparency = 1
+    list.LayoutOrder = 4
+    list.Parent = body
+    local listLayout = Instance.new("UIListLayout", list)
+    listLayout.Padding = UDim.new(0, gap)
+    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local rows = {}
+
+    local function applyOrder()
+        for i, name in ipairs(Config.Stats.Order) do
+            rows[name].LayoutOrder = i
+        end
     end
+
+    local function makeRow(name)
+        local row = Instance.new("Frame")
+        row.Name = name
+        row.Size = UDim2.new(1, 0, 0, rowH)
+        row.BackgroundColor3 = Theme.Surface
+        row.BackgroundTransparency = 0.15
+        row.BorderSizePixel = 0
+        row.Parent = list
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+        local grip = Instance.new("TextButton")
+        grip.Name = "Grip"
+        grip.Size = UDim2.fromOffset(26, rowH)
+        grip.BackgroundTransparency = 1
+        grip.Text = "≡"
+        grip.TextColor3 = Theme.TextDim
+        grip.Font = Enum.Font.GothamBold
+        grip.TextSize = 16
+        grip.AutoButtonColor = false
+        grip.Parent = row
+
+        local nameLabel = Instance.new("TextLabel")
+        nameLabel.Size = UDim2.new(1, -150, 1, 0)
+        nameLabel.Position = UDim2.fromOffset(30, 0)
+        nameLabel.BackgroundTransparency = 1
+        nameLabel.Text = name:sub(1, 1):upper() .. name:sub(2)
+        nameLabel.TextColor3 = Theme.Text
+        nameLabel.Font = Enum.Font.Gotham
+        nameLabel.TextSize = 12
+        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        nameLabel.Parent = row
+
+        local sentLabel = Instance.new("TextLabel")
+        sentLabel.Size = UDim2.fromOffset(60, rowH)
+        sentLabel.Position = UDim2.new(1, -128, 0, 0)
+        sentLabel.BackgroundTransparency = 1
+        sentLabel.Text = "0 sent"
+        sentLabel.TextColor3 = Theme.TextDim
+        sentLabel.Font = Enum.Font.Gotham
+        sentLabel.TextSize = 11
+        sentLabel.TextXAlignment = Enum.TextXAlignment.Right
+        sentLabel.Parent = row
+        ST.labels[name] = sentLabel
+
+        local box = Instance.new("TextBox")
+        box.Size = UDim2.fromOffset(56, 22)
+        box.Position = UDim2.new(1, -62, 0.5, -11)
+        box.BackgroundColor3 = Theme.Card
+        box.BorderSizePixel = 0
+        box.Text = tostring(ST.target[name])
+        box.PlaceholderText = "0"
+        box.TextColor3 = Theme.Accent
+        box.Font = Enum.Font.GothamMedium
+        box.TextSize = 12
+        box.ClearTextOnFocus = false
+        box.Parent = row
+        Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
+        box.FocusLost:Connect(function()
+            local n = tonumber(box.Text)
+            if n and n == n and n >= 0 and n <= Config.Stats.MaxTarget then
+                ST.target[name] = math.floor(n)
+                ST.done = false
+            end
+            box.Text = tostring(ST.target[name])
+        end)
+
+        -- drag by the grip: the row moves to the slot under the cursor (slot = start slot + vertical movement / row pitch)
+        local dragging, startY, startSlot
+        grip.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+                dragging, startY = true, i.Position.Y
+                startSlot = table.find(Config.Stats.Order, name)
+                row.BackgroundColor3 = Theme.Picked
+                grip.TextColor3 = Theme.Accent
+            end
+        end)
+        track(UserInputService.InputChanged:Connect(function(i)
+            if not dragging then return end
+            if i.UserInputType ~= Enum.UserInputType.MouseMovement and i.UserInputType ~= Enum.UserInputType.Touch then return end
+            local want = math.clamp(startSlot + math.floor((i.Position.Y - startY) / (rowH + gap) + 0.5), 1, #Config.Stats.Order)
+            local cur = table.find(Config.Stats.Order, name)
+            if want ~= cur then
+                table.remove(Config.Stats.Order, cur)
+                table.insert(Config.Stats.Order, want, name)
+                startSlot, startY = want, i.Position.Y
+                applyOrder()
+            end
+        end))
+        track(UserInputService.InputEnded:Connect(function(i)
+            if dragging and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
+                dragging = false
+                row.BackgroundColor3 = Theme.Surface
+                grip.TextColor3 = Theme.TextDim
+            end
+        end))
+
+        rows[name] = row
+    end
+
+    for _, name in ipairs(Config.Stats.Order) do makeRow(name) end
+    applyOrder()
+
     createValueRow(body, "Seconds between points", function() return Config.Stats.Interval end, function(v)
         Config.Stats.Interval = v
-    end, 0.1, 0.1, 5, 1 + #Config.Stats.Names + 1)
+    end, 0.1, 0.1, 5, 5)
+
+    local resetBtn = Instance.new("TextButton")
+    resetBtn.Size = UDim2.new(1, 0, 0, 28)
+    resetBtn.BackgroundColor3 = Theme.Off
+    resetBtn.BorderSizePixel = 0
+    resetBtn.Text = "Reset sent counts"
+    resetBtn.TextColor3 = Theme.Text
+    resetBtn.Font = Enum.Font.GothamMedium
+    resetBtn.TextSize = 12
+    resetBtn.AutoButtonColor = true
+    resetBtn.LayoutOrder = 6
+    resetBtn.Parent = body
+    Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 7)
+    resetBtn.MouseButton1Click:Connect(function()
+        for name in pairs(ST.sent) do ST.sent[name] = 0 end
+        ST.done = false
+        ST.refresh()
+    end)
 end
 
 do
