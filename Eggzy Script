@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.109-inkdetect",
+    BuildNote = "v1.7.111-fbscript",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3602,7 +3602,7 @@ createNavButton("Auto", 3, "↻")
 local autoPage = createPage("Auto")
 
 -- ===================== FULLBRIGHT =====================
--- Fullbright = the Lighting values below. The originals are saved once when it turns on and put back when it turns off (or on unload).
+-- Fullbright: the originals (Lighting values, effect Enabled flags) are saved once when it turns on and put back when it turns off or on unload.
 -- Blind detection, from your WrenchBlindWatch log of one Octopop blind: a ScreenGui named "inksplash" (with a LocalScript "inkeffect" and an
 -- ImageLabel) appears in PlayerGui when the blind starts and is removed about 6 seconds later. Config.Blind.Detect is true while it exists.
 -- Note: it is a GUI image overlay, so fullbright raises the lighting but does not remove the overlay itself.
@@ -3614,31 +3614,69 @@ Config.Blind = {
         return ink ~= nil and ink:IsA("ScreenGui") and ink.Enabled
     end,
 }
+-- Same recipe as the fullbright script you sent (it did not flicker): Ambient white, Brightness 1, FogEnd huge, the Bloom / Blur /
+-- ColorCorrection / SunRays effects in Lighting turned off, and a PointLight on your HumanoidRootPart (Brightness 1, Range 60).
+-- ClockTime, GlobalShadows, OutdoorAmbient and ExposureCompensation are left alone: the game animates them, which is what made mine flicker.
 Config.Fullbright = {
-    Brightness = 2, ClockTime = 14, FogEnd = 1e6, FogStart = 1e5, GlobalShadows = false,
-    Ambient = Color3.fromRGB(178, 178, 178), OutdoorAmbient = Color3.fromRGB(178, 178, 178), ExposureCompensation = 0,
+    Lighting = { Ambient = Color3.fromRGB(255, 255, 255), Brightness = 1, FogEnd = 1e10 },
+    EffectClasses = { "BloomEffect", "BlurEffect", "ColorCorrectionEffect", "SunRaysEffect" },
+    LightName = "EggzyHeadlight", LightBrightness = 1, LightRange = 60,
+    EffectScan = 0.25, -- seconds between passes that switch off effects the game adds later
 }
 State.Fullbright = false
 State.BlindFB = false
 
 function T3.fbApply()
+    local fb = Config.Fullbright
     if not T3.fbSaved then
-        T3.fbSaved = {}
-        for key in pairs(Config.Fullbright) do
+        T3.fbSaved = { props = {}, effects = {} }
+        for key in pairs(fb.Lighting) do
             local okR, value = pcall(function() return Lighting[key] end)
-            if okR then T3.fbSaved[key] = value end
+            if okR then T3.fbSaved.props[key] = value end
+        end
+        T3.fbNextScan = 0
+    end
+    for key, value in pairs(fb.Lighting) do
+        pcall(function()
+            if Lighting[key] ~= value then Lighting[key] = value end
+        end)
+    end
+    if os.clock() >= (T3.fbNextScan or 0) then
+        T3.fbNextScan = os.clock() + fb.EffectScan
+        for _, inst in ipairs(Lighting:GetDescendants()) do
+            for _, className in ipairs(fb.EffectClasses) do
+                if inst:IsA(className) then
+                    if T3.fbSaved.effects[inst] == nil then T3.fbSaved.effects[inst] = inst.Enabled end
+                    if inst.Enabled then pcall(function() inst.Enabled = false end) end
+                    break
+                end
+            end
         end
     end
-    for key, value in pairs(Config.Fullbright) do
-        pcall(function() Lighting[key] = value end)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if root and not root:FindFirstChild(fb.LightName) then
+        local light = Instance.new("PointLight")
+        light.Name = fb.LightName
+        light.Brightness = fb.LightBrightness
+        light.Range = fb.LightRange
+        light.Parent = root
     end
 end
 
 function T3.fbRestore()
-    if T3.fbSaved then
-        for key, value in pairs(T3.fbSaved) do
+    local saved = T3.fbSaved
+    if saved then
+        for key, value in pairs(saved.props) do
             pcall(function() Lighting[key] = value end)
         end
+        for inst, wasEnabled in pairs(saved.effects) do
+            if inst.Parent then pcall(function() inst.Enabled = wasEnabled end) end
+        end
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local light = root and root:FindFirstChild(Config.Fullbright.LightName)
+        if light then light:Destroy() end
         T3.fbSaved = nil
     end
 end
@@ -3650,17 +3688,25 @@ function T3.blinded()
     return okD and result == true
 end
 
-task.spawn(function()
-    while Alive do
-        if State.Fullbright or (State.BlindFB and T3.blinded()) then
-            T3.fbApply()
-        else
-            T3.fbRestore()
-        end
-        task.wait(0.1)
+-- every frame (Heartbeat), not every 0.1 s: the game rewrites Lighting constantly, and a slower loop is what made it flicker
+track(RunService.Heartbeat:Connect(function()
+    if State.Fullbright or (State.BlindFB and T3.blinded()) then
+        T3.fbApply()
+    else
+        T3.fbRestore()
     end
-    T3.fbRestore()
-end)
+end))
+
+-- Fullbright toggles live on the Player page (card order 3); they are created here because they need Config.Blind and T3.fb* defined above.
+do
+    local card, body = createCard(playerPage, "Lighting", 3)
+    createToggle(body, "Fullbright", 1, function() return State.Fullbright end, function(v)
+        State.Fullbright = v
+    end)
+    createToggle(body, "Fullbright when blinded", 2, function() return State.BlindFB end, function(v)
+        State.BlindFB = v
+    end, function() return type(Config.Blind.Detect) ~= "function" end)
+end
 
 -- Is this boss's mission really present in the current map? Strict: the mission folder must exist here and hold the giver remote.
 -- (questRemote also falls back to ANY CLIENTTALK under bossdropmission for firing, which made every boss look "in this map".)
@@ -3980,12 +4026,6 @@ do
     createToggle(body, "ESP Boss NPCs", 3, function() return State.ESP.BossNPCESP end, function(v)
         State.ESP.BossNPCESP = v
     end)
-    createToggle(body, "Fullbright", 4, function() return State.Fullbright end, function(v)
-        State.Fullbright = v
-    end)
-    createToggle(body, "Fullbright when blinded", 5, function() return State.BlindFB end, function(v)
-        State.BlindFB = v
-    end, function() return type(Config.Blind.Detect) ~= "function" end)
 end
 
 setPage("Home")
