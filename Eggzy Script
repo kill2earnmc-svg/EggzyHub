@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.107-lockreset",
+    BuildNote = "v1.7.109-inkdetect",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3601,6 +3601,67 @@ end
 createNavButton("Auto", 3, "↻")
 local autoPage = createPage("Auto")
 
+-- ===================== FULLBRIGHT =====================
+-- Fullbright = the Lighting values below. The originals are saved once when it turns on and put back when it turns off (or on unload).
+-- Blind detection, from your WrenchBlindWatch log of one Octopop blind: a ScreenGui named "inksplash" (with a LocalScript "inkeffect" and an
+-- ImageLabel) appears in PlayerGui when the blind starts and is removed about 6 seconds later. Config.Blind.Detect is true while it exists.
+-- Note: it is a GUI image overlay, so fullbright raises the lighting but does not remove the overlay itself.
+Config.Blind = {
+    GuiName = "inksplash",
+    Detect = function()
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local ink = pg and pg:FindFirstChild(Config.Blind.GuiName)
+        return ink ~= nil and ink:IsA("ScreenGui") and ink.Enabled
+    end,
+}
+Config.Fullbright = {
+    Brightness = 2, ClockTime = 14, FogEnd = 1e6, FogStart = 1e5, GlobalShadows = false,
+    Ambient = Color3.fromRGB(178, 178, 178), OutdoorAmbient = Color3.fromRGB(178, 178, 178), ExposureCompensation = 0,
+}
+State.Fullbright = false
+State.BlindFB = false
+
+function T3.fbApply()
+    if not T3.fbSaved then
+        T3.fbSaved = {}
+        for key in pairs(Config.Fullbright) do
+            local okR, value = pcall(function() return Lighting[key] end)
+            if okR then T3.fbSaved[key] = value end
+        end
+    end
+    for key, value in pairs(Config.Fullbright) do
+        pcall(function() Lighting[key] = value end)
+    end
+end
+
+function T3.fbRestore()
+    if T3.fbSaved then
+        for key, value in pairs(T3.fbSaved) do
+            pcall(function() Lighting[key] = value end)
+        end
+        T3.fbSaved = nil
+    end
+end
+
+function T3.blinded()
+    local detect = Config.Blind.Detect
+    if type(detect) ~= "function" then return false end
+    local okD, result = pcall(detect)
+    return okD and result == true
+end
+
+task.spawn(function()
+    while Alive do
+        if State.Fullbright or (State.BlindFB and T3.blinded()) then
+            T3.fbApply()
+        else
+            T3.fbRestore()
+        end
+        task.wait(0.1)
+    end
+    T3.fbRestore()
+end)
+
 -- Is this boss's mission really present in the current map? Strict: the mission folder must exist here and hold the giver remote.
 -- (questRemote also falls back to ANY CLIENTTALK under bossdropmission for firing, which made every boss look "in this map".)
 function T3.inMap(boss)
@@ -3919,6 +3980,12 @@ do
     createToggle(body, "ESP Boss NPCs", 3, function() return State.ESP.BossNPCESP end, function(v)
         State.ESP.BossNPCESP = v
     end)
+    createToggle(body, "Fullbright", 4, function() return State.Fullbright end, function(v)
+        State.Fullbright = v
+    end)
+    createToggle(body, "Fullbright when blinded", 5, function() return State.BlindFB end, function(v)
+        State.BlindFB = v
+    end, function() return type(Config.Blind.Detect) ~= "function" end)
 end
 
 setPage("Home")
@@ -3974,6 +4041,7 @@ Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 5)
 closeBtn.MouseButton1Click:Connect(function()
     Alive = false
     State.Mentor = false
+    pcall(T3.fbRestore)
     pcall(stopFaceLock)
     pcall(T3.stopAim)
     stopFly()
