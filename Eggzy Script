@@ -62,7 +62,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.88-scroll",
+    BuildNote = "v1.7.89-scroll",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -2085,7 +2085,7 @@ function T3.bindAim()
         if not (Alive and State.Mentor and cam) then return end
         local camPos = cam.CFrame.Position
         if T3.aimUp then
-            cam.CFrame = CFrame.lookAt(camPos, camPos + Vector3.yAxis, Vector3.zAxis)
+            cam.CFrame = CFrame.lookAt(camPos, camPos + (T3.aimDir or Vector3.yAxis), Vector3.zAxis)
             return
         end
         local tg = T3.aimTarget
@@ -2100,12 +2100,13 @@ function T3.startAim(target)
     T3.bindAim()
 end
 
-function T3.startAimUp()
+function T3.startAimUp(dir)
     T3.aimUp = true
+    T3.aimDir = dir or Vector3.yAxis
     T3.bindAim()
 end
 
--- Quest 5. Fly + noclip on, camera/character looking straight up, stand Depth studs under the boss,
+-- Quest 5. Fly + noclip on, camera/character looking straight down (above the boss) or up (under it), Offset studs from the boss,
 -- press Q until the boss reads alive, then set its Humanoid.Health to 0 (same call the grind uses).
 function T3.findFightBoss(mentorName)
     local t = Config.Mentor.Training5
@@ -2248,7 +2249,7 @@ function T3.fight()
     State.Noclip = true
     State.Kill = true
     startFly()
-    T3.startAimUp()
+    T3.startAimUp(t.Offset >= 0 and -Vector3.yAxis or Vector3.yAxis) -- straight down when above the boss, straight up when under it
 
     local ok, result = pcall(function()
         local deadline = os.clock() + t.BossTimeout
