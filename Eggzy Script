@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.122-rankbelow",
+    BuildNote = "v1.7.124-dungeontab",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 122 },
+    Version = { Tweaks = 124 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -4133,6 +4133,220 @@ do
 end
 
 do
+    -- Dungeons. KNOWN: the 12 dungeon names (yours). UNKNOWN and therefore not built: how a dungeon is entered (remote/arguments), the boss names
+    -- of each dungeon, and where dungeon mobs live (assumed Workspace.npc like the field bosses). Boss names go in Config.Dungeons.Bosses[<dungeon>]
+    -- as the boss's npctype/bossdrop name (same match the Quest Bosses use); "Print npc names" lists what is in Workspace.npc to fill them in.
+    Config.Dungeons = {
+        List = { "Training Grounds", "Des Exams", "Samurai Bridge", "Sen Exams", "Narumaki Bridge", "Ember Hideout",
+                 "Sovereign Summit", "Dawn Hideout", "Shindai Valley", "Korashi Manor", "Mount Maki", "Tyn Stone" },
+        Bosses = {},          -- [dungeon name] = { "boss name", ... }   UNSET until you give the names
+        AuraRange = 300,      -- studs, ASSUMED kill-aura reach (the hub's Instant Kill uses 120)
+        Interval = 0.25,
+    }
+    State.AutoDungeon = false
+    State.Dungeon = Config.Dungeons.List[1]
+    local DG = { status = "off", bossSeen = false, bossDone = false, warned = {} }
+
+    local function dungeonBossNames()
+        return Config.Dungeons.Bosses[State.Dungeon] or {}
+    end
+
+    local function killModel(h, part)
+        local r = Config.Kill.UseHitRemote and LocalPlayer:FindFirstChild(Config.Kill.RemoteName)
+        if r and r:IsA("BaseRemoteEvent") then
+            pcall(r.FireServer, r, "target", part)
+        end
+        if h.Health > 0 then
+            scriptZeroed[h] = true
+            pcall(function()
+                h.Health = 0
+                local maxHp = tonumber(h.MaxHealth)
+                if maxHp then h:TakeDamage(maxHp) end
+            end)
+        end
+    end
+
+    task.spawn(function()
+        while Alive do
+            task.wait(Config.Dungeons.Interval)
+            if not State.AutoDungeon then
+                DG.status = "off"
+                DG.bossSeen, DG.bossDone = false, false
+            else
+                local root = getRoot()
+                local folder = Workspace:FindFirstChild("npc")
+                if not root then
+                    DG.status = "no character"
+                elseif not folder then
+                    DG.status = "workspace.npc missing"
+                else
+                    local bossKeys = {}
+                    for _, name in ipairs(dungeonBossNames()) do bossKeys[#bossKeys + 1] = normalize(name) end
+                    if #bossKeys == 0 and not DG.warned[State.Dungeon] then
+                        DG.warned[State.Dungeon] = true
+                        print("[EggzyDungeon] no boss names set for " .. tostring(State.Dungeon) .. " (Config.Dungeons.Bosses), killing mobs only")
+                    end
+                    local killed, bossAlive = 0, false
+                    for _, m in ipairs(folder:GetChildren()) do
+                        if m:IsA("Model") and m ~= LocalPlayer.Character then
+                            local h = m:FindFirstChildOfClass("Humanoid")
+                            local part = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Head")
+                            if h and part and isLiving(h) then
+                                local isBoss = false
+                                for _, key in ipairs(bossKeys) do
+                                    if bossMatches(m, key) then isBoss = true break end
+                                end
+                                if isBoss then
+                                    bossAlive = true
+                                    if not DG.bossSeen then
+                                        DG.bossSeen = true
+                                        print("[EggzyDungeon] boss spawned: " .. m.Name)
+                                    end
+                                    killModel(h, part)
+                                    killed += 1
+                                elseif h.Health > 0 and (part.Position - root.Position).Magnitude <= Config.Dungeons.AuraRange then
+                                    killModel(h, part)
+                                    killed += 1
+                                end
+                            end
+                        end
+                    end
+                    if DG.bossSeen and not bossAlive and not DG.bossDone then
+                        DG.bossDone = true
+                        print("[EggzyDungeon] boss killed, waiting for the next step")
+                    end
+                    if DG.bossDone then
+                        DG.status = "boss killed, waiting"
+                    elseif bossAlive then
+                        DG.status = "boss alive, killing it"
+                    else
+                        DG.status = string.format("aura on, %d hit this pass", killed)
+                    end
+                end
+            end
+        end
+    end)
+
+    createNavButton("Dungeons", 4, "⚔")
+    local dungeonsPage = createPage("Dungeons")
+    local card, body = createCard(dungeonsPage, "Dungeons", 1)
+
+    local selLabel = Instance.new("TextLabel")
+    selLabel.Size = UDim2.new(1, 0, 0, 22)
+    selLabel.BackgroundTransparency = 1
+    selLabel.Text = ""
+    selLabel.TextColor3 = Theme.TextDim
+    selLabel.Font = Enum.Font.Gotham
+    selLabel.TextSize = 11
+    selLabel.TextXAlignment = Enum.TextXAlignment.Left
+    selLabel.LayoutOrder = 1
+    selLabel.Parent = body
+
+    local list = Instance.new("ScrollingFrame")
+    list.Name = "DungeonList"
+    list.Size = UDim2.new(1, 0, 0, 180)
+    list.BackgroundColor3 = Theme.Surface
+    list.BackgroundTransparency = 0.3
+    list.BorderSizePixel = 0
+    list.ScrollBarThickness = 3
+    list.ScrollBarImageColor3 = Theme.Accent
+    list.CanvasSize = UDim2.new()
+    list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    list.LayoutOrder = 2
+    list.Parent = body
+    Instance.new("UICorner", list).CornerRadius = UDim.new(0, 6)
+    local listPad = Instance.new("UIPadding", list)
+    listPad.PaddingTop = UDim.new(0, 4)
+    listPad.PaddingBottom = UDim.new(0, 4)
+    listPad.PaddingLeft = UDim.new(0, 4)
+    listPad.PaddingRight = UDim.new(0, 4)
+    local listLayout = Instance.new("UIListLayout", list)
+    listLayout.Padding = UDim.new(0, 2)
+    listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local rows = {}
+    local function renderRows()
+        for name, row in pairs(rows) do
+            local picked = State.Dungeon == name
+            row.Text = (picked and "  [x]  " or "  [  ]  ") .. name
+            row.BackgroundColor3 = picked and Theme.Picked or Theme.Surface
+        end
+        selLabel.Text = "Selected: " .. tostring(State.Dungeon)
+    end
+    for i, name in ipairs(Config.Dungeons.List) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, 0, 0, 24)
+        b.BackgroundColor3 = Theme.Surface
+        b.TextColor3 = Theme.Text
+        b.Font = Enum.Font.Gotham
+        b.TextSize = 12
+        b.TextXAlignment = Enum.TextXAlignment.Left
+        b.AutoButtonColor = false
+        b.BorderSizePixel = 0
+        b.LayoutOrder = i
+        b.Parent = list
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+        b.MouseButton1Click:Connect(function()
+            State.Dungeon = name
+            DG.bossSeen, DG.bossDone = false, false
+            renderRows()
+        end)
+        rows[name] = b
+    end
+    renderRows()
+
+    createToggle(body, "Auto Dungeon (kill aura + boss check)", 3, function() return State.AutoDungeon end, function(v)
+        State.AutoDungeon = v
+        DG.bossSeen, DG.bossDone = false, false
+    end)
+
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, 0, 0, 22)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Text = "Status: off"
+    statusLabel.TextColor3 = Theme.TextDim
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.TextSize = 11
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.LayoutOrder = 4
+    statusLabel.Parent = body
+    task.spawn(function()
+        while Alive do
+            statusLabel.Text = "Status: " .. DG.status
+            task.wait(0.3)
+        end
+    end)
+
+    local dumpBtn = Instance.new("TextButton")
+    dumpBtn.Size = UDim2.new(1, 0, 0, 28)
+    dumpBtn.BackgroundColor3 = Theme.Off
+    dumpBtn.BorderSizePixel = 0
+    dumpBtn.Text = "Print npc names (console)"
+    dumpBtn.TextColor3 = Theme.Text
+    dumpBtn.Font = Enum.Font.GothamMedium
+    dumpBtn.TextSize = 12
+    dumpBtn.AutoButtonColor = true
+    dumpBtn.LayoutOrder = 5
+    dumpBtn.Parent = body
+    Instance.new("UICorner", dumpBtn).CornerRadius = UDim.new(0, 7)
+    dumpBtn.MouseButton1Click:Connect(function()
+        local folder = Workspace:FindFirstChild("npc")
+        if not folder then print("[EggzyDungeon] workspace.npc missing") return end
+        print("[EggzyDungeon] ---- Workspace.npc ----")
+        for _, m in ipairs(folder:GetChildren()) do
+            if m:IsA("Model") then
+                local h = m:FindFirstChildOfClass("Humanoid")
+                local nt = m:FindFirstChild("npctype")
+                local bd = m:FindFirstChild("bossdrop")
+                print(string.format("[EggzyDungeon] %s | npctype=%s | bossdrop=%s | hp=%s/%s", m.Name,
+                    nt and nt:IsA("StringValue") and nt.Value or "-", bd and bd:IsA("StringValue") and bd.Value or "-",
+                    h and string.format("%.0f", h.Health) or "-", h and string.format("%.0f", h.MaxHealth) or "-"))
+            end
+        end
+    end)
+end
+
+do
     local card, body = createCard(autoPage, "Quest Bosses", 3)
 
     local countLabel = Instance.new("TextLabel")
@@ -4279,7 +4493,7 @@ do
     renderAll()
 end
 
-createNavButton("Scrolls", 4, "◇")
+createNavButton("Scrolls", 5, "◇")
 local scrollsPage = createPage("Scrolls")
 
 do
@@ -4289,7 +4503,7 @@ do
     end)
 end
 
-createNavButton("ESP", 5, "◎")
+createNavButton("ESP", 6, "◎")
 local espPage = createPage("ESP")
 
 do
@@ -4305,7 +4519,7 @@ do
     end)
 end
 
-createNavButton("Misc", 6, "✦")
+createNavButton("Misc", 7, "✦")
 local miscPage = createPage("Misc")
 
 -- Teleport to Player: one row per other player in the server (kept live on join/leave); clicking a row moves you next to that player's root part.
