@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.91-log",
+    BuildNote = "v1.7.93-progress",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -175,7 +175,8 @@ local Config = {
         StartDelay     = 12,              -- from you: wait 12 s after the quest is taken before the first M1
         M1Period       = 1.0,             -- from you: one M1 press per second
         M1Hold         = 0.05,            -- uncalibrated click hold time
-        StartMission   = 1,               -- the chain starts here (1 = M1 x30); each training hands over to the next, 5 is the fight
+        ProgressFile   = "EggzyMentorProgress.txt", -- remembers which training you are on across leave/rejoin (the game's own quest state is not known yet)
+        StartMission   = 1,               -- the chain starts here when there is no progress file (1 = M1 x30); each training hands over to the next, 5 is the fight, 6 = all done
         Mission        = 1,               -- which training the loop runs: 1 = M1 x30, 2 = teleport routine (Training2), 3 = kunai aim (Training3), 4 = look only (Training4), 5 = mentor fight (Training5, fight server only)
         Training3 = {                    -- quest 3: aim at the target and throw kunai with M1, 20 hits
             TargetName    = "kunaiaim", -- from you: the target is the part called kunaiaim (path of the live one: Workspace.Terrain.<PlayerName>.kunaiaim, also searched by name)
@@ -2304,6 +2305,34 @@ function T3.questSnapshot(tag)
     if Config.Debug then print("[EggzyMentor] quest snapshot saved: " .. tostring(tag)) end
 end
 
+-- Progress: which training the chain is on, kept in ProgressFile so leaving and rejoining continues where you were.
+-- A training that was interrupted restarts from its beginning (the count inside it is not saved).
+function T3.loadProgress()
+    local m = Config.Mentor
+    T3.progress, T3.progressName = m.StartMission, nil
+    if isfile and readfile and isfile(m.ProgressFile) then
+        local okR, txt = pcall(readfile, m.ProgressFile)
+        if okR and type(txt) == "string" then
+            local mission, name = txt:match("^(%d+)|([^|]*)")
+            mission = tonumber(mission)
+            if mission and mission >= 1 and mission <= 6 then
+                T3.progress = mission
+                T3.progressName = (name and name ~= "") and name or nil
+            end
+        end
+    end
+    m.Mission = T3.progress
+end
+
+function T3.saveProgress()
+    if writefile then
+        pcall(writefile, Config.Mentor.ProgressFile, tostring(T3.progress) .. "|" .. (T3.progressName or "") .. "|" .. tostring(os.time()))
+    end
+end
+
+T3.loadProgress()
+print(string.format("[EggzyMentor] progress file: training %d%s", T3.progress, T3.progressName and (" (mentor " .. T3.progressName .. ")") or " (no saved mentor)"))
+
 function T3.queueReload()
     if T3.queued then return true, "already queued" end
     local okG, genvL = pcall(getgenv)
@@ -2314,11 +2343,40 @@ function T3.queueReload()
     if not q then return false, "executor has no queue_on_teleport" end
     local loader, note = T3.findReloadLoader()
     if not loader then return false, note end
-    local code = 'repeat task.wait() until game:IsLoaded() and game:GetService("Players").LocalPlayer\n'
-        .. 'getgenv().EggzyResume = "t5"\n' .. loader
+    -- The queued script proves it ran (EggzyQueueRan.txt + a line in EggzyHub_log.txt), logs a launch failure instead of
+    -- dying silently, and runs once per server (re-arming below can queue it several times).
+    local code = table.concat({
+        'local function logLine(msg)',
+        '  pcall(function()',
+        '    if not writefile then return end',
+        '    local old = (isfile and isfile("EggzyHub_log.txt") and readfile("EggzyHub_log.txt")) or ""',
+        '    writefile("EggzyHub_log.txt", old .. "\\n" .. os.date("%X") .. " [queued payload] " .. msg)',
+        '  end)',
+        'end',
+        'if getgenv().EggzyPayloadJob == game.JobId then return end',
+        'getgenv().EggzyPayloadJob = game.JobId',
+        'pcall(function() if writefile then writefile("EggzyQueueRan.txt", os.date() .. " place " .. game.PlaceId .. " job " .. game.JobId) end end)',
+        'logLine("ran in place " .. game.PlaceId .. " job " .. game.JobId)',
+        'repeat task.wait() until game:IsLoaded() and game:GetService("Players").LocalPlayer',
+        'getgenv().EggzyResume = "t5"',
+        'local ok, err = pcall(function()',
+        loader,
+        'end)',
+        'logLine(ok and "hub launched" or ("hub launch failed: " .. tostring(err)))',
+    }, "\n")
     local okQ, err = pcall(q, code)
     if not okQ then return false, tostring(err) end
     T3.queued = true
+    T3.queuePayload = code
+    -- Some executors keep only the LAST queued script (your auto-relog script re-arms for that reason), and other scripts
+    -- may queue their own: re-queue every 10 s while we wait for the teleport.
+    task.spawn(function()
+        local untilT = os.clock() + Config.Mentor.Training5.TeleportWait + 10
+        while Alive and os.clock() < untilT do
+            task.wait(10)
+            pcall(q, code)
+        end
+    end)
     return true, "queued via " .. note
 end
 
@@ -2484,6 +2542,10 @@ task.spawn(function()
     local t2Fails = 0
     while Alive do
         local m = Config.Mentor
+        if State.Mentor and m.Mission ~= T3.progress then
+            T3.progress = m.Mission
+            T3.saveProgress()
+        end
         if not State.Mentor then
             if phase ~= "talk" or presses ~= 0 then
                 phase, presses = "talk", 0
@@ -2491,12 +2553,24 @@ task.spawn(function()
             end
             nextAt = 0
             MentorInfo.phase = "off"
-            -- switched off = chain restarts from the first training next time (in the fight server it stays on 5)
-            m.Mission = (mentorMissionsFolder() == nil) and 5 or m.StartMission
+            -- switched off: the chain continues from the saved progress next time (in the fight server it stays on 5)
+            m.Mission = (mentorMissionsFolder() == nil) and 5 or T3.progress
         elseif State.Grind then
             MentorInfo.phase = "paused (grind)"
         elseif os.clock() >= nextAt then
             pcall(function()
+                if m.Mission >= 6 then
+                    local okN, nm = pcall(detectMentorName)
+                    if okN and nm and T3.progressName and T3.progressName ~= "" and nm ~= T3.progressName then
+                        print("[EggzyMentor] different mentor than the saved progress (" .. T3.progressName .. " -> " .. nm .. "): chain restarts at training " .. m.StartMission)
+                        m.Mission = m.StartMission
+                        T3.progressName = nm
+                    else
+                        MentorInfo.phase = "all 5 trainings done (delete " .. m.ProgressFile .. " to restart)"
+                        nextAt = os.clock() + 2
+                        return
+                    end
+                end
                 if phase == "talk" and m.Mission == 5 and mentorMissionsFolder() == nil then phase = "t5" end
                 if phase == "talk" then
                     local name, source = detectMentorName()
@@ -2504,6 +2578,14 @@ task.spawn(function()
                         print("[EggzyMentor] mentor:", name, "|", source)
                     end
                     MentorInfo.name, MentorInfo.source = name, source
+                    if name and T3.progressName and T3.progressName ~= "" and name ~= T3.progressName and m.Mission == T3.progress and m.Mission ~= m.StartMission then
+                        print("[EggzyMentor] different mentor than the saved progress (" .. T3.progressName .. " -> " .. name .. "): chain restarts at training " .. m.StartMission)
+                        m.Mission = m.StartMission
+                    end
+                    if name and name ~= T3.progressName then
+                        T3.progressName = name
+                        T3.saveProgress()
+                    end
                     local remote = name and mentorRemoteFor(name)
                     local reloadNote = nil
                     if remote and m.Mission == 5 then
@@ -2538,6 +2620,9 @@ task.spawn(function()
                         print("[EggzyMentor] t5:", tostring(okFight), summary)
                     end
                     MentorInfo.phase = "t5 done: " .. summary
+                    if okFight and (summary:find("is dead", 1, true) or summary:find("is gone", 1, true)) then
+                        m.Mission = 6 -- all five trainings done; saved by the loop above
+                    end
                     phase, presses = "t5done", 0
                 elseif phase == "t5done" then
                     nextAt = os.clock() + 1
@@ -3299,7 +3384,7 @@ do
                 mentorText = MentorInfo.name .. " | " .. MentorInfo.phase
             end
             if State.Mentor then
-                mentorText = string.format("T%d/5 ", Config.Mentor.Mission) .. mentorText
+                mentorText = (Config.Mentor.Mission >= 6 and "T5/5 done " or string.format("T%d/5 ", Config.Mentor.Mission)) .. mentorText
             end
             local map = {
                 ["Auto Quest"] = State.AutoQuest,
