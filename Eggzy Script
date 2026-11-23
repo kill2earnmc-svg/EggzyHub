@@ -62,7 +62,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.76-mentor",
+    BuildNote = "v1.7.79-mentor",
     Debug = true,
     PanicKey = Enum.KeyCode.End,
     ToggleKey = Enum.KeyCode.RightShift,
@@ -171,6 +171,8 @@ local Config = {
             Depth        = 90,          -- from you: stand 90 studs under the boss
             BossFolder   = "npc",       -- ASSUMED: same folder the grind uses; unverified in the mentor-fight server (falls back to Workspace children)
             TeleportWait = 60,          -- seconds to wait for the server teleport after talking before talking again (uncalibrated)
+            ResumeFile   = "EggzyResume.txt", -- flag file written when the fight-server teleport is expected; survives the teleport
+            ResumeWindow = 300,         -- seconds the flag stays valid after it was written (uncalibrated: teleport + load time)
             ReloadFile   = "EggzyHub.lua", -- executor workspace file the hub is reloaded from after the teleport (or set getgenv().EggzyHubReloadUrl)
             BossTimeout  = 180,         -- seconds to keep pressing Q waiting for the boss before giving up (uncalibrated)
             AliveConfirm = 1.0,         -- seconds the boss must read alive before its hp is set to 0 (uncalibrated)
@@ -2146,6 +2148,17 @@ function T3.findReloadLoader()
         T3.loader, T3.loaderNote = string.format("loadstring(game:HttpGet(%q))()", url), "url"
         return T3.loader, T3.loaderNote
     end
+    -- Best source: the full hub text carried inside the file that launched it (EggzyHubSolo.lua).
+    local embedded = okE and genv and genv.EggzyHubSourceText
+    if type(embedded) == "string" and #embedded > 1000 then
+        local level = 0
+        while embedded:find("]" .. string.rep("=", level) .. "]", 1, true) do level += 1 end
+        local eq = string.rep("=", level)
+        T3.loader = "getgenv().EggzyHubSourceText = [" .. eq .. "[" .. embedded .. "]" .. eq .. "]\n"
+            .. "loadstring(getgenv().EggzyHubSourceText)()"
+        T3.loaderNote = "embedded hub source (" .. #embedded .. " bytes)"
+        return T3.loader, T3.loaderNote
+    end
     local function viaFile(name)
         return string.format("loadstring(readfile(%q))()", name)
     end
@@ -2180,8 +2193,43 @@ function T3.findReloadLoader()
     return nil, T3.loaderNote
 end
 
+function T3.markResume()
+    local t = Config.Mentor.Training5
+    local okE, genv = pcall(getgenv)
+    if okE and genv then genv.EggzyResume = "t5" end
+    if writefile then pcall(writefile, t.ResumeFile, tostring(os.time())) end
+end
+
+function T3.clearResume()
+    local t = Config.Mentor.Training5
+    local okE, genv = pcall(getgenv)
+    if okE and genv then genv.EggzyResume = nil end
+    if delfile and isfile and isfile(t.ResumeFile) then
+        pcall(delfile, t.ResumeFile)
+    elseif writefile then
+        pcall(writefile, t.ResumeFile, "0")
+    end
+end
+
+-- true when the flag file was written recently; always consumes (clears) it
+function T3.takeResumeFlag()
+    local t = Config.Mentor.Training5
+    local fresh = false
+    if isfile and readfile and isfile(t.ResumeFile) then
+        local okR, txt = pcall(readfile, t.ResumeFile)
+        local ts = okR and tonumber(txt)
+        if ts and math.abs(os.time() - ts) <= t.ResumeWindow then fresh = true end
+    end
+    T3.clearResume()
+    return fresh
+end
+
 function T3.queueReload()
     if T3.queued then return true, "already queued" end
+    local okG, genvL = pcall(getgenv)
+    if okG and genvL and genvL.EggzyLoaderActive then
+        return true, "EggzyLoader is armed (hub does not queue a second copy)"
+    end
     local q = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
     if not q then return false, "executor has no queue_on_teleport" end
     local loader, note = T3.findReloadLoader()
@@ -2197,7 +2245,6 @@ end
 function T3.fight()
     local t, g = Config.Mentor.Training5, Config.Grind
     local function stillOn() return Alive and State.Mentor and not State.Grind end
-    local prevFly, prevNoclip = State.Fly, State.Noclip
     local okName, mentorName = pcall(detectMentorName)
     if not (okName and mentorName) then mentorName = MentorInfo.name end
 
@@ -2210,6 +2257,10 @@ function T3.fight()
         local deadline = os.clock() + t.BossTimeout
         local aliveSince = nil
         while stillOn() and os.clock() < deadline do
+            -- fly and noclip must stay on the whole fight: re-assert every loop (a respawn or the game can reset them)
+            State.Fly = true
+            State.Noclip = true
+            if not (flyBV and flyBV.Parent) then startFly() end
             local model, hum, part = T3.findFightBoss(mentorName)
             if model then
                 MentorInfo.phase = string.format("t5 under %s (hp %.0f)", model.Name, hum.Health)
@@ -2240,9 +2291,7 @@ function T3.fight()
     end)
 
     T3.stopAim()
-    State.Noclip = prevNoclip
-    State.Fly = prevFly
-    if not prevFly then stopFly() end
+    -- Flight and noclip are left ON after the fight (you said they must be on); turn them off in the Player page.
     return ok, tostring(result)
 end
 
@@ -2318,8 +2367,9 @@ end
 
 do
     local okE, genv = pcall(getgenv)
-    if okE and genv and genv.EggzyResume == "t5" then
-        genv.EggzyResume = nil
+    local byFlag = T3.takeResumeFlag()
+    if (okE and genv and genv.EggzyResume == "t5") or byFlag then
+        if okE and genv then genv.EggzyResume = nil end
         Config.Mentor.Mission = 5
         State.Mentor = true
         T3.resume = true
@@ -2353,6 +2403,7 @@ task.spawn(function()
                     local remote = name and mentorRemoteFor(name)
                     local reloadNote = nil
                     if remote and m.Mission == 5 then
+                        T3.markResume()
                         local okQ, whyQ = T3.queueReload()
                         if Config.Debug and whyQ ~= "already queued" then
                             print("[EggzyMentor] reload for the fight server:", okQ, whyQ)
@@ -2372,6 +2423,7 @@ task.spawn(function()
                     MentorInfo.phase = remote and "talk failed" or ("no remote: " .. tostring(source))
                     nextAt = os.clock() + m.Interval
                 elseif phase == "t5wait" then
+                    T3.clearResume()
                     phase = "talk"
                     nextAt = os.clock() + m.Interval
                 elseif phase == "t5" then
