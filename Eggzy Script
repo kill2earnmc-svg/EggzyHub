@@ -62,7 +62,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.83-mentor",
+    BuildNote = "v1.7.84-mentor",
     Debug = true,
     PanicKey = Enum.KeyCode.End,
     ToggleKey = Enum.KeyCode.RightShift,
@@ -152,6 +152,7 @@ local Config = {
         StartDelay     = 12,              -- from you: wait 12 s after the quest is taken before the first M1
         M1Period       = 1.0,             -- from you: one M1 press per second
         M1Hold         = 0.05,            -- uncalibrated click hold time
+        StartMission   = 1,               -- the chain starts here (1 = M1 x30); each training hands over to the next, 5 is the fight
         Mission        = 1,               -- which training the loop runs: 1 = M1 x30, 2 = teleport routine (Training2), 3 = kunai aim (Training3), 4 = look only (Training4), 5 = mentor fight (Training5, fight server only)
         Training3 = {                    -- quest 3: aim at the target and throw kunai with M1, 20 hits
             TargetName    = "kunaiaim", -- from you: the target is the part called kunaiaim (path of the live one: Workspace.Terrain.<PlayerName>.kunaiaim, also searched by name)
@@ -2400,6 +2401,8 @@ task.spawn(function()
             end
             nextAt = 0
             MentorInfo.phase = "off"
+            -- switched off = chain restarts from the first training next time (in the fight server it stays on 5)
+            m.Mission = (mentorMissionsFolder() == nil) and 5 or m.StartMission
         elseif State.Grind then
             MentorInfo.phase = "paused (grind)"
         elseif os.clock() >= nextAt then
@@ -2458,6 +2461,7 @@ task.spawn(function()
                     end
                     if presses >= t.Repeats then
                         MentorInfo.phase = "t2 done"
+                        m.Mission = 3
                         phase, presses, t2Fails = "talk", 0, 0
                         nextAt = os.clock() + m.Interval
                     elseif t2Fails >= t.MaxFails then
@@ -2482,7 +2486,8 @@ task.spawn(function()
                     end
                     MentorInfo.phase = string.format("%s targets %d/%d", lookOnly and "t4" or "t3", presses, t.Repeats)
                     if presses >= t.Repeats then
-                        MentorInfo.phase = "t3 done"
+                        MentorInfo.phase = lookOnly and "t4 done" or "t3 done"
+                        m.Mission = lookOnly and 5 or 4
                         phase, presses, t2Fails = "talk", 0, 0
                         nextAt = os.clock() + m.Interval
                     elseif t2Fails >= t.MaxFails then
@@ -2505,6 +2510,7 @@ task.spawn(function()
                     end
                     MentorInfo.phase = string.format("M1 %d/%d", presses, m.M1Count)
                     if presses >= m.M1Count then
+                        m.Mission = 2
                         phase, presses = "talk", 0
                         nextAt = os.clock() + m.Interval
                     else
@@ -3057,6 +3063,9 @@ do
             if MentorInfo.name and State.Mentor then
                 mentorText = MentorInfo.name .. " | " .. MentorInfo.phase
             end
+            if State.Mentor then
+                mentorText = string.format("T%d/5 ", Config.Mentor.Mission) .. mentorText
+            end
             local map = {
                 ["Auto Quest"] = State.AutoQuest,
                 ["Scroll Stealer"] = State.Scrolls,
@@ -3285,44 +3294,6 @@ do
         pcall(probeMentor)
     end)
 
-    local function missionText()
-        if Config.Mentor.Mission == 2 then
-            return "Training: 2 (teleport routine), click to switch"
-        elseif Config.Mentor.Mission == 3 then
-            return "Training: 3 (kunai aim), click to switch"
-        elseif Config.Mentor.Mission == 4 then
-            return "Training: 4 (look only), click to switch"
-        elseif Config.Mentor.Mission == 5 then
-            return "Training: 5 (mentor fight), click to switch"
-        end
-        return "Training: 1 (M1 x30), click to switch"
-    end
-
-    local missionBtn = Instance.new("TextButton")
-    missionBtn.Name = "MentorMission"
-    missionBtn.Size = UDim2.new(1, 0, 0, 30)
-    missionBtn.BackgroundColor3 = Theme.Surface
-    missionBtn.BackgroundTransparency = 0.15
-    missionBtn.Text = missionText()
-    missionBtn.TextColor3 = Theme.Accent
-    missionBtn.Font = Enum.Font.GothamMedium
-    missionBtn.TextSize = 12
-    missionBtn.AutoButtonColor = false
-    missionBtn.BorderSizePixel = 0
-    missionBtn.LayoutOrder = 3
-    missionBtn.Parent = body
-    Instance.new("UICorner", missionBtn).CornerRadius = UDim.new(0, 7)
-    local missionStroke = Instance.new("UIStroke")
-    missionStroke.Color = Theme.BorderSoft
-    missionStroke.Thickness = 1
-    missionStroke.Transparency = 0.6
-    missionStroke.Parent = missionBtn
-    missionBtn.MouseEnter:Connect(function() missionBtn.BackgroundColor3 = Theme.SurfaceHover end)
-    missionBtn.MouseLeave:Connect(function() missionBtn.BackgroundColor3 = Theme.Surface end)
-    missionBtn.MouseButton1Click:Connect(function()
-        Config.Mentor.Mission = (Config.Mentor.Mission % 5) + 1
-        missionBtn.Text = missionText()
-    end)
 end
 
 do
