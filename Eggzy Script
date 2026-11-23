@@ -62,8 +62,9 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.84-mentor",
+    BuildNote = "v1.7.86-mentor",
     Debug = true,
+    MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
     ToggleKey = Enum.KeyCode.RightShift,
     BackupToggleKey = Enum.KeyCode.Insert,
@@ -145,7 +146,7 @@ local Config = {
         Default        = "Bruce Kenichi", -- only used when detection finds nothing; the one mentor captured so far
         -- ASSUMPTION (unverified): the game keeps your mentor as a string/object value or attribute
         -- under LocalPlayer. Key names below only rank candidates; a match always requires the
-        -- value to equal a real folder name under RootPath. Use the Probe button to confirm.
+        -- value to equal a real folder name under RootPath.
         DetectKeywords = { "mentor", "sensei" },
         Interval       = 5.0,             -- uncalibrated, seconds between talk attempts
         M1Count        = 30,              -- from you: first mission is pressing M1 30 times
@@ -519,7 +520,7 @@ local function detectVillageFromWorld(fromPos)
     end
 
     if #hits == 0 then
-        if Config.Debug then
+        if Config.MapDebug then
             print("[EggzyMap] no landmark hits")
         end
         return nil, math.huge
@@ -527,7 +528,7 @@ local function detectVillageFromWorld(fromPos)
 
     table.sort(hits, function(a, b) return a.dist < b.dist end)
 
-    if Config.Debug then
+    if Config.MapDebug then
         local parts = {}
         for i = 1, math.min(5, #hits) do
             parts[#parts + 1] = string.format("%s@%.0f", hits[i].name, hits[i].dist)
@@ -1828,21 +1829,6 @@ local function detectMentorName()
         return byKey[normKey(def)], "default (captured)"
     end
     return nil, "no match"
-end
-
-local function probeMentor()
-    local folder = mentorMissionsFolder()
-    print("[EggzyMentor] probe: folder", folder and folder:GetFullName() or "MISSING")
-    if folder then
-        for _, m in ipairs(folder:GetChildren()) do
-            print("[EggzyMentor]   mentor mission folder:", m.Name, "remote:", mentorRemoteFor(m.Name) and "yes" or "no")
-        end
-    end
-    for _, c in ipairs(mentorCandidates()) do
-        print(string.format("[EggzyMentor]   player value: %s = %q%s", c.path, tostring(c.raw), c.kw and "  (key match)" or ""))
-    end
-    local name, source = detectMentorName()
-    print("[EggzyMentor] probe result:", name, "|", source)
 end
 
 local function clickM1(hold)
@@ -3268,31 +3254,6 @@ do
         State.Mentor = v
         if not v then forceReleaseInputs() end
     end, function() return mentorMissionsFolder() == nil and Config.Mentor.Mission ~= 5 end)
-
-    local probeBtn = Instance.new("TextButton")
-    probeBtn.Name = "MentorProbe"
-    probeBtn.Size = UDim2.new(1, 0, 0, 30)
-    probeBtn.BackgroundColor3 = Theme.Surface
-    probeBtn.BackgroundTransparency = 0.15
-    probeBtn.Text = "Mentor Probe (print detection to console)"
-    probeBtn.TextColor3 = Theme.Text
-    probeBtn.Font = Enum.Font.GothamMedium
-    probeBtn.TextSize = 12
-    probeBtn.AutoButtonColor = false
-    probeBtn.BorderSizePixel = 0
-    probeBtn.LayoutOrder = 2
-    probeBtn.Parent = body
-    Instance.new("UICorner", probeBtn).CornerRadius = UDim.new(0, 7)
-    local probeStroke = Instance.new("UIStroke")
-    probeStroke.Color = Theme.BorderSoft
-    probeStroke.Thickness = 1
-    probeStroke.Transparency = 0.6
-    probeStroke.Parent = probeBtn
-    probeBtn.MouseEnter:Connect(function() probeBtn.BackgroundColor3 = Theme.SurfaceHover end)
-    probeBtn.MouseLeave:Connect(function() probeBtn.BackgroundColor3 = Theme.Surface end)
-    probeBtn.MouseButton1Click:Connect(function()
-        pcall(probeMentor)
-    end)
 
 end
 
