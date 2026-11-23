@@ -84,7 +84,7 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.102-noreset",
+    BuildNote = "v1.7.103-unstick",
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -1450,6 +1450,37 @@ task.spawn(function()
         task.wait(0.2)
     end
 end)
+
+-- ===================== COMBAT UNSTICK =====================
+-- From your A/B diff: when it breaks, <character>.combat.disable is true (it was false), together with combat.functions.key = "qend",
+-- weapon.on = false and walkSpeed 0. That is the game's own "can't act" lock; a move that never reached its end step leaves it on.
+-- If it stays true for DisableSeconds (UNCALIBRATED: the real length of the longest legitimate move is not known) while the hub is
+-- automating, set it back to false. Only that one value is touched.
+do
+    Config.Unstick = { Enabled = true, DisableSeconds = 8, Poll = 0.5 }
+    task.spawn(function()
+        local trackedValue, since = nil, nil
+        while Alive do
+            local u = Config.Unstick
+            local hubBusy = State.Grind or State.AutoQuest or State.Mentor
+            local char = LocalPlayer.Character
+            local combat = char and char:FindFirstChild("combat")
+            local disable = combat and combat:FindFirstChild("disable")
+            if u.Enabled and hubBusy and disable and disable:IsA("BoolValue") and disable.Value == true then
+                if trackedValue ~= disable then
+                    trackedValue, since = disable, os.clock()
+                elseif os.clock() - since >= u.DisableSeconds then
+                    pcall(function() disable.Value = false end)
+                    print(string.format("[EggzyUnstick] combat.disable was stuck true for %.0fs: set back to false", os.clock() - since))
+                    trackedValue, since = nil, nil
+                end
+            else
+                trackedValue, since = nil, nil
+            end
+            task.wait(u.Poll)
+        end
+    end)
+end
 
 -- ===================== INPUT PANIC =====================
 local function panic()
