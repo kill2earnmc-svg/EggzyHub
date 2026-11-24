@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.160-killrestored",
+    BuildNote = "v1.7.161-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 160 },
+    Version = { Tweaks = 161 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -335,7 +335,7 @@ local Alive = true
 local State = { 
     Fly = false, Noclip = false, AutoQuest = false, Kill = false,
     Scrolls = false, TpScroll = false, Grind = false, Fps = false,
-    Speed = false, Jump = false, InfiniteJump = false, Mentor = false,
+    Speed = false, Jump = false, InfiniteJump = false, Mentor = false, Collector = false,
     Returning = false, AutoRank = false,
     ScrollTrip = false, -- true while the scroll stealer is away from the grind position
     BossAlive = nil,
@@ -3788,6 +3788,754 @@ function T3.inMap(boss)
     return cur ~= nil and (cur:IsA("RemoteEvent") or cur:IsA("BaseRemoteEvent"))
 end
 
+-- ===================== BOSS COLLECTOR =====================
+-- Toggle on the Auto page. For every boss giver in the map it is standing in (Workspace.<folder>.missions.<boss>.missiongiver.CLIENTTALK):
+-- skip it if you already own its drops, otherwise talk to the giver, go UNDER the boss (the Money Grind height, placeUnder), leave Instant Kill on and
+-- press Q every QEvery seconds; when a scroll drops, teleport on top of it, look straight down, M1 and Q every 5 s. When the map is done it goes
+-- to the private server of the next map (startevent:FireServer("createprivateserver", place id), captured with WrenchSpyLite) and the hub reloads
+-- itself there (same queue_on_teleport loader the Mentor uses) and carries on.
+-- The module is kept as source text and compiled with loadstring inside a pcall at toggle time, so a mistake in it cannot stop the hub from loading.
+-- NOT VERIFIED in game: CLIENTTALK starting these bosses, M1 picking a scroll up, what Q does at 5 s, createprivateserver fired directly, the hub reload after the hop.
+Config.Collector = {
+    QEvery = 5,                  -- from you: Q every 5 seconds (fight and scroll pickup)
+    Step = 0.25,
+    HeightAboveScroll = 3,       -- uncalibrated
+    ClickFallbackAfter = 4,      -- seconds of M1 before fireclickdetector is tried
+    ScrollGiveUp = 14,           -- seconds on one scroll before moving on (uncalibrated)
+    TalkRetries = 4,
+    SpawnWait = 15,              -- seconds to wait for a boss after CLIENTTALK (uncalibrated)
+    GiverHeight = 4,
+    KillRange = 600,             -- studs from the giver / you in which a living Workspace.npc model counts as the boss (uncalibrated)
+    FightTimeout = 240,
+    QuietExit = 8,               -- seconds with no boss and no scroll before a round counts as finished
+    CombatStuckSeconds = 30,     -- incombat true this long with no boss and no scroll = combat bug, character is reset
+    MaxRoundsPerBoss = 300,
+    RequirePrivate = true,       -- outside a private server (Workspace.playerps missing) it first goes into the private server of the current map
+    AutoHop = true,
+    HopWait = 40,
+    -- from you: no tailed beasts. Any boss, folder or live npc name containing one of these is never fought. The beast names come from the
+    -- ReplicatedStorage.bosses template list in your WrenchMapScan paste.
+    ExcludeNames = { "tail", "gyuki", "isobu", "kokuo", "kurama", "matabi", "saiken", "shukaku", "son goku", "songoku", "chomei" },
+    OnlyRoster = true,           -- ONLY bosses named in OnlyNames are fought. This is what keeps Hollow and other non-boss missions out
+    OnlyNames = {                -- your own 43 boss names
+        "Ailee Minakami", "Alphirama Dangan", "Apollo Sabaku", "Arahaki Jokei", "Ashen Storm", "Azim Senko", "Bankai Akuma",
+        "Borumaki", "Bruce Kenichi", "Deuce Wanziame", "Dio Senko", "Eastwood Korashi", "Garin Atomic", "Ghost Azarashi",
+        "Giovanni Shizen", "Headless Korashi", "Jayramaki", "Jiso Seishin", "Kabu Cobra", "Kamaki", "Light Jokei",
+        "Menza Azarashi", "Minakaze Senko", "Narumaki", "Odin Saberu", "Pika Senko", "PTS Deva", "PTS Raion", "Raion Akuma",
+        "Raion Rengoku", "Renshiki", "Riser Akuma", "Rykan Shizen", "Ryuji Kenichi", "Sarachia Akuma", "Satori Akuma",
+        "Satoru Okami", "Sengoku", "Shiba Glacier", "Shindai Akuma", "Shiver Akuma", "Tengoku", "Xeno Dokei",
+    },
+    SkipMaps = { "none" },       -- map buttons never visited. "none" (place 590798306) looks like a placeholder: UNVERIFIED
+    TrustNameMatch = true,       -- unknown-drop boss is skipped if you own <name>BOSS / <name>2ndStage / <name>CHAR (HEURISTIC)
+    ResumeFile = "EggzyCollectorResume.txt",
+    ResumeWindow = 300,
+    Status = "idle",
+    SettleWait = 6,              -- seconds to let a freshly hopped map load before looking for boss givers (uncalibrated)
+    Bosses = {                   -- drop keys come from your pastes: renshikiBOSS and Renshiki2ndStage (dump), shiverakumaBOSS and shindaiakumaBOSS (pickup test)
+        { name = "Renshiki",      root = "bossdropmission", drops = { "renshikiBOSS", "Renshiki2ndStage" } },
+        { name = "Shiver Akuma",  root = "bossdropmission", drops = { "shiverakumaBOSS" } },
+        { name = "Shindai Akuma", root = "bossdropmission", drops = { "shindaiakumaBOSS" } },
+        { name = "Raion Rengoku", root = "bossdropmission", drops = { "raionrengokuBOSS" } },   -- model name not seen, key is in your unlocked list
+    },
+}
+
+T3.collectorSource = [==[
+-- Boss Collector module. Loaded by the hub with loadstring inside a pcall, so a mistake in here can never stop the hub from starting.
+-- Everything it needs from the hub arrives in the Hub table (the same helpers the Money Grind and Instant Kill use).
+return function(Hub)
+    local C = { running = false }
+    local Players, Workspace, RunService = Hub.Players, Hub.Workspace, Hub.RunService
+    local LocalPlayer, Config, State = Hub.LocalPlayer, Hub.Config, Hub.State
+    local CFG = Config.Collector
+    local LOOK_NAME = "EggzyCollectorLook"
+    local lookOn = false
+    local changed = {}   -- State flags this module turned on, restored on Stop
+
+    local function log(msg)
+        CFG.Status = msg   -- shown live under the toggle
+        print(string.format("[EggzyCollector %s] %s", os.date("%H:%M:%S"), msg))
+    end
+
+    local function on()
+        return C.running and Hub.isAlive()
+    end
+
+    -- ------------------------------------------------------------ character helpers
+    local function getChar()
+        local root, hum = Hub.getRoot()
+        if root and hum and hum.Health > 0 then return root, hum end
+        return nil
+    end
+
+    local function waitForChar(timeout)
+        local t0 = os.clock()
+        while on() and os.clock() - t0 < timeout do
+            local root, hum = getChar()
+            if root then return root, hum end
+            task.wait(0.25)
+        end
+        return nil
+    end
+
+    local function teleport(pos)
+        local root = getChar()
+        if not root then return false end
+        root.CFrame = CFrame.new(pos)
+        root.AssemblyLinearVelocity = Vector3.zero
+        return true
+    end
+
+    -- fly + noclip + instant kill are the hub's own switches (the Money Grind turns the same ones on)
+    local function ensureFarmState()
+        for _, name in ipairs({ "Fly", "Noclip", "Kill" }) do
+            if not State[name] then
+                State[name] = true
+                changed[name] = true
+            end
+        end
+        local root = getChar()
+        if root and State.Fly then
+            local hasMover = false
+            for _, c in ipairs(root:GetChildren()) do
+                if c:IsA("BodyVelocity") then hasMover = true break end
+            end
+            if not hasMover then pcall(Hub.startFly) end
+        end
+    end
+
+    local function unlockCamera()
+        if lookOn then
+            pcall(function() RunService:UnbindFromRenderStep(LOOK_NAME) end)
+            lookOn = false
+        end
+    end
+
+    local function lockCameraDown(targetPart)
+        if lookOn then return end
+        local cam = Workspace.CurrentCamera
+        if not cam then return end
+        lookOn = true
+        RunService:BindToRenderStep(LOOK_NAME, Enum.RenderPriority.Camera.Value + 1, function()
+            if targetPart and targetPart.Parent then
+                local from = targetPart.Position + Vector3.new(0, CFG.HeightAboveScroll + 2, 0)
+                cam.CFrame = CFrame.lookAt(from, targetPart.Position, Vector3.new(0, 0, -1))
+            end
+        end)
+    end
+
+    local function pressQ()
+        task.spawn(function()
+            Hub.pressKey(Config.Grind.Key, Config.Grind.KeyHold, true)
+        end)
+    end
+
+    -- ------------------------------------------------------------ what you own
+    local function unlockedFolder()
+        local statz = LocalPlayer:FindFirstChild("statz")
+        return statz and statz:FindFirstChild("unlocked")
+    end
+
+    local function owned(key)
+        local u = unlockedFolder()
+        return u ~= nil and u:FindFirstChild(key) ~= nil
+    end
+
+    local function allKeys(boss)
+        local keys, seen = {}, {}
+        for _, k in ipairs(boss.drops or {}) do
+            if not seen[k] then seen[k] = true keys[#keys + 1] = k end
+        end
+        for _, k in ipairs(boss.learned or {}) do
+            if not seen[k] then seen[k] = true keys[#keys + 1] = k end
+        end
+        return keys
+    end
+
+    local function missingDrops(boss)
+        local list = {}
+        for _, key in ipairs(allKeys(boss)) do
+            if not owned(key) then list[#list + 1] = key end
+        end
+        return list
+    end
+
+    local function learn(boss, key, source)
+        if type(key) ~= "string" or key == "" then return end
+        boss.learned = boss.learned or {}
+        for _, k in ipairs(boss.learned) do if k == key then return end end
+        for _, k in ipairs(boss.drops or {}) do if k == key then return end end
+        boss.learned[#boss.learned + 1] = key
+        log(string.format("%s: learned drop key '%s' from %s (owned: %s)", boss.name, key, source, tostring(owned(key))))
+    end
+
+    -- HEURISTIC, NOT VERIFIED: keys in your unlocked list look like <name>BOSS / <name>2ndStage / <name>CHAR
+    local function nameMatchOwned(boss)
+        local u = unlockedFolder()
+        if not u then return false end
+        local base = string.lower((string.gsub(boss.name, "[^%w]", "")))
+        local want = {}
+        want[base .. "boss"] = true
+        want[base .. "2ndstage"] = true
+        want[base .. "char"] = true
+        for _, c in ipairs(u:GetChildren()) do
+            if want[string.lower(c.Name)] then return true end
+        end
+        return false
+    end
+
+    -- ------------------------------------------------------------ bosses in this map
+    local function nameExcluded(text)
+        text = string.lower(text)
+        for _, bad in ipairs(CFG.ExcludeNames) do
+            if string.find(text, string.lower(bad), 1, true) then return true end
+        end
+        return false
+    end
+
+    local function excluded(boss)
+        return nameExcluded(boss.name .. " " .. boss.root)
+    end
+
+    local function norm(s)
+        return string.lower((string.gsub(tostring(s), "[^%w]", "")))
+    end
+
+    local rosterSet
+    local function onRoster(boss)
+        if not CFG.OnlyRoster then return true end
+        if not rosterSet then
+            rosterSet = {}
+            for _, n in ipairs(CFG.OnlyNames) do rosterSet[norm(n)] = true end
+        end
+        return rosterSet[norm(boss.name)] == true
+    end
+
+    local function bossParts(boss)
+        local root = Workspace:FindFirstChild(boss.root)
+        local missions = root and root:FindFirstChild("missions")
+        local m = missions and missions:FindFirstChild(boss.name)
+        local giver = m and m:FindFirstChild("missiongiver")
+        local talk = giver and giver:FindFirstChild("CLIENTTALK")
+        local giverPos
+        if giver then
+            local ok, p = pcall(function() return giver:GetPivot().Position end)
+            if ok then giverPos = p end
+        end
+        return talk, giverPos
+    end
+
+    -- every <folder>.missions.<name> in Workspace with missiongiver.CLIENTTALK, plus the known table
+    local function buildBossList()
+        local list, seen = {}, {}
+        for _, b in ipairs(CFG.Bosses) do
+            list[#list + 1] = b
+            seen[b.root .. "/" .. b.name] = true
+        end
+        for _, root in ipairs(Workspace:GetChildren()) do
+            local missions = root:FindFirstChild("missions")
+            if missions then
+                for _, m in ipairs(missions:GetChildren()) do
+                    local giver = m:FindFirstChild("missiongiver")
+                    if giver and giver:FindFirstChild("CLIENTTALK") and not seen[root.Name .. "/" .. m.Name] then
+                        seen[root.Name .. "/" .. m.Name] = true
+                        list[#list + 1] = { name = m.Name, root = root.Name, drops = nil }
+                    end
+                end
+            end
+        end
+        return list
+    end
+
+    local function bossSkipReason(boss)
+        if excluded(boss) then return "excluded by name (tailed beast), skipping" end
+        if not onRoster(boss) then return "not on your boss list (OnlyRoster), skipping" end
+        local talk = bossParts(boss)
+        if not talk then return "giver or CLIENTTALK is not in this map, skipping" end
+        if #allKeys(boss) == 0 and CFG.TrustNameMatch and nameMatchOwned(boss) then
+            return "you already own a key matching its name (heuristic), skipping"
+        end
+        return nil
+    end
+
+    -- ------------------------------------------------------------ boss and scroll queries
+    -- nearest living model in Workspace.npc to `ref`, a model that carries a bossdrop value wins over one that does not
+    local function livingBoss(ref)
+        local folder = Workspace:FindFirstChild("npc")
+        if not folder then return nil end
+        local best, bestScore
+        for _, m in ipairs(folder:GetChildren()) do
+            if m:IsA("Model") and m ~= LocalPlayer.Character and not nameExcluded(m.Name) then
+                local hum = m:FindFirstChildOfClass("Humanoid")
+                local part = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Head")
+                if hum and part and hum.Health > 0 then
+                    local d = (part.Position - ref).Magnitude
+                    if d <= CFG.KillRange then
+                        local score = d - (m:FindFirstChild("bossdrop") and 100000 or 0)
+                        if not bestScore or score < bestScore then
+                            best, bestScore = { model = m, hum = hum, part = part }, score
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    local function findScrolls()
+        local list = {}
+        for _, m in ipairs(Workspace:GetChildren()) do
+            if m:IsA("Model") and m:FindFirstChild("scroll2") then
+                local sh = m:FindFirstChild("sh")
+                local cd = sh and sh:FindFirstChildWhichIsA("ClickDetector")
+                if sh and cd and sh:IsA("BasePart") then
+                    list[#list + 1] = { model = m, sh = sh, cd = cd }
+                end
+            end
+        end
+        return list
+    end
+
+    -- ------------------------------------------------------------ actions
+    local function startBoss(boss)
+        local talk, giverPos = bossParts(boss)
+        if not (talk and talk:IsA("RemoteEvent") and giverPos) then
+            log(boss.name .. ": giver or CLIENTTALK not found, skipping")
+            return false
+        end
+        for attempt = 1, CFG.TalkRetries do
+            if not on() then return false end
+            ensureFarmState()
+            teleport(giverPos + Vector3.new(0, CFG.GiverHeight, 0))
+            task.wait(0.4)
+            pcall(function() talk:FireServer(LocalPlayer) end)
+            log(string.format("%s: CLIENTTALK fired (attempt %d), waiting for the boss", boss.name, attempt))
+            local t0 = os.clock()
+            while on() and os.clock() - t0 < CFG.SpawnWait do
+                if livingBoss(giverPos) then return true end
+                task.wait(0.25)
+            end
+        end
+        log(boss.name .. ": no boss appeared after " .. CFG.TalkRetries .. " tries")
+        return false
+    end
+
+    -- teleport on top of the scroll, camera straight down, M1, Q every QEvery seconds
+    local function pickUp(entry)
+        local t0 = os.clock()
+        local lastQ, clickFallback, cdFallback = 0, false, false
+        local before = {}
+        local u = unlockedFolder()
+        if u then for _, c in ipairs(u:GetChildren()) do before[c.Name] = true end end
+        log("scroll " .. entry.model.Name .. ": teleporting on top of it and clicking")
+        while on() and entry.model.Parent and os.clock() - t0 < CFG.ScrollGiveUp do
+            teleport(entry.sh.Position + Vector3.new(0, CFG.HeightAboveScroll, 0))
+            lockCameraDown(entry.sh)
+            task.wait(0.1)
+            Hub.clickM1(0.05)
+            if not clickFallback and os.clock() - t0 >= 2 and mouse1click then
+                clickFallback = true
+                pcall(mouse1click)
+            end
+            if os.clock() - lastQ >= CFG.QEvery then
+                lastQ = os.clock()
+                pressQ()
+            end
+            if not cdFallback and os.clock() - t0 >= CFG.ClickFallbackAfter and fireclickdetector then
+                cdFallback = true
+                pcall(fireclickdetector, entry.cd)
+            end
+            task.wait(0.3)
+        end
+        unlockCamera()
+        local added = {}
+        local u2 = unlockedFolder()
+        if u2 then
+            for _, c in ipairs(u2:GetChildren()) do
+                if not before[c.Name] then added[#added + 1] = c.Name end
+            end
+        end
+        log(string.format("scroll %s: %s | new statz.unlocked entries: %s", entry.model.Name,
+            entry.model.Parent and "still there when giving up" or "gone", #added > 0 and table.concat(added, ", ") or "none"))
+    end
+
+    -- under the boss (the hub's Money Grind height), Instant Kill on, Q every QEvery seconds; then the scrolls
+    local function fightAndCollect(boss, giverPos)
+        local t0 = os.clock()
+        local quiet, lastQ = 0, 0
+        local height = Hub.getBossHeight(boss.name)
+        while on() and os.clock() - t0 < CFG.FightTimeout do
+            ensureFarmState()
+            local _, hum = Hub.getRoot()
+            if not (hum and hum.Health > 0) then
+                waitForChar(30)
+            end
+            local ref = giverPos
+            local root = getChar()
+            if root then ref = root.Position end
+            ref = ref or giverPos
+            local b = ref and livingBoss(ref) or nil
+            if b then
+                quiet = 0
+                local bd = b.model:FindFirstChild("bossdrop")
+                if bd and bd:IsA("StringValue") then learn(boss, bd.Value, "live npc " .. b.model.Name) end
+                Hub.placeUnder(b.part, height)
+                if os.clock() - lastQ >= CFG.QEvery then
+                    lastQ = os.clock()
+                    pressQ()
+                end
+                task.wait(CFG.Step)
+            else
+                local scrolls = findScrolls()
+                if #scrolls > 0 then
+                    quiet = 0
+                    learn(boss, scrolls[1].model.Name, "dropped scroll model")
+                    pickUp(scrolls[1])
+                else
+                    quiet = quiet + CFG.Step
+                    task.wait(CFG.Step)
+                end
+            end
+            if quiet >= CFG.QuietExit then break end
+        end
+    end
+
+    -- combat bug: incombat stays true with no boss and no scroll
+    local function startWatchdog()
+        task.spawn(function()
+            local stuckSince
+            while on() do
+                task.wait(1)
+                local ic = LocalPlayer:FindFirstChild("incombat")
+                local root = getChar()
+                local stuck = false
+                if ic and ic.Value == true and root and not livingBoss(root.Position) and #findScrolls() == 0 then
+                    stuck = true
+                end
+                if stuck then
+                    stuckSince = stuckSince or os.clock()
+                    if os.clock() - stuckSince >= CFG.CombatStuckSeconds then
+                        log("combat bug: incombat stayed true with no boss and no scroll, resetting the character")
+                        stuckSince = nil
+                        unlockCamera()
+                        local c = LocalPlayer.Character
+                        if c then pcall(function() c:BreakJoints() end) end
+                    end
+                else
+                    stuckSince = nil
+                end
+            end
+        end)
+    end
+
+    -- ------------------------------------------------------------ private server + map hopping
+    -- captured with WrenchSpyLite: startevent:FireServer("createprivateserver", <place id of the map button>)
+    local function inPrivateServer()
+        return Workspace:FindFirstChild("playerps") ~= nil
+    end
+
+    local function readMaps()
+        local maps, seenPlace = {}, {}
+        local gui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local main = gui and gui:FindFirstChild("Main")
+        local menu = main and main:FindFirstChild("ingame") and main.ingame:FindFirstChild("Menu")
+        local arena = menu and menu:FindFirstChild("ArenaTab")
+        local list = arena and arena:FindFirstChild("List")
+        if not list then return maps end
+        local skip = {}
+        for _, n in ipairs(CFG.SkipMaps) do skip[string.lower(n)] = true end
+        for _, m in ipairs(list:GetChildren()) do
+            local pv = m:FindFirstChild("place")
+            local pid = pv and pv:IsA("ValueBase") and tonumber(pv.Value)
+            if pid and not skip[string.lower(m.Name)] and not seenPlace[pid] then
+                seenPlace[pid] = true
+                maps[#maps + 1] = { name = m.Name, place = pid }
+            end
+        end
+        return maps
+    end
+
+    local function idList(set)
+        local ids = {}
+        for id in pairs(set) do ids[#ids + 1] = string.format("%d", id) end
+        table.sort(ids)
+        return ids
+    end
+
+    local function reloadCode(visitedSet)
+        local loader, note = Hub.T3.findReloadLoader()
+        if not loader then return nil, note end
+        return table.concat({
+            'if getgenv().EggzyCollectorJob == game.JobId then return end',
+            'getgenv().EggzyCollectorJob = game.JobId',
+            'repeat task.wait() until game:IsLoaded() and game:GetService("Players").LocalPlayer',
+            'getgenv().EggzyCollectorResume = { visited = { ' .. table.concat(idList(visitedSet), ", ") .. ' } }',
+            loader,
+        }, "\n")
+    end
+
+    -- returns only when the hop did NOT happen (a successful teleport ends the old server's script); "fatal" = no hop can ever work this session
+    local function hopTo(place, visitedSet)
+        local startevent = LocalPlayer:FindFirstChild("startevent")
+        local passes = LocalPlayer:FindFirstChild("gamepasses")
+        if not (startevent and startevent:IsA("BaseRemoteEvent")) then log("hop: startevent not found") return "fatal" end
+        if not (passes and passes:FindFirstChild("privateservers")) then
+            log("hop: you do not have the privateservers gamepass, the game would only open its purchase prompt")
+            return "fatal"
+        end
+        local q = queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+        if not q then log("hop: this executor has no queue_on_teleport") return "fatal" end
+        local code, note = reloadCode(visitedSet)
+        if not code then log("hop: no reload source for the hub. Run EggzyHubSolo.lua instead of EggzyHub.lua") return "fatal" end
+        if writefile then
+            pcall(writefile, CFG.ResumeFile, table.concat({ tostring(os.time()), tostring(game.JobId), table.concat(idList(visitedSet), ",") }, "|"))
+        end
+        pcall(q, code)
+        log("hop: firing createprivateserver for place " .. string.format("%d", place))
+        pcall(startevent.FireServer, startevent, "createprivateserver", place)
+        local t0 = os.clock()
+        local nextQ = t0 + 10
+        while on() and os.clock() - t0 < CFG.HopWait do
+            task.wait(1)
+            if os.clock() >= nextQ then
+                nextQ = os.clock() + 10
+                pcall(q, code)   -- some executors keep only the last queued script
+            end
+        end
+    end
+
+    -- ------------------------------------------------------------ run / stop
+    function C.Stop()
+        C.running = false
+        unlockCamera()
+        Hub.forceReleaseInputs()
+        for name in pairs(changed) do State[name] = false end
+        if changed.Fly then pcall(Hub.stopFly) end
+        changed = {}
+        State.Collector = false
+        CFG.Status = "STOPPED. last: " .. tostring(CFG.Status)
+    end
+
+    function C.Run(resumeList)
+        C.running = true
+        State.Collector = true
+        if not game:IsLoaded() then game.Loaded:Wait() end
+        do
+            local t0 = os.clock()
+            while on() and not unlockedFolder() and os.clock() - t0 < 60 do task.wait(0.5) end
+        end
+        if not unlockedFolder() then
+            log("statz.unlocked not found, cannot check what you own. Stopping.")
+            C.Stop()
+            return
+        end
+
+        local visited, resumed = {}, false
+        if type(resumeList) == "table" then
+            resumed = true
+            for _, id in ipairs(resumeList) do
+                if tonumber(id) then visited[tonumber(id)] = true end
+            end
+        end
+        log(string.format("started in place %d%s", game.PlaceId, resumed and (" after a hop, maps done so far: " .. #idList(visited)) or ""))
+
+        if CFG.RequirePrivate and not resumed and not inPrivateServer() then
+            log("not in a private server (Workspace.playerps is missing), hopping into the private server of this map first")
+            hopTo(game.PlaceId, visited)
+            log("private hop did not happen, stopping so nothing is farmed outside a private server")
+            C.Stop()
+            return
+        end
+        visited[game.PlaceId] = true
+        waitForChar(30)
+        if resumed then
+            log("arrived by hop, letting the map load for " .. CFG.SettleWait .. " seconds")
+            task.wait(CFG.SettleWait)
+        end
+        startWatchdog()
+
+        local bossList = buildBossList()
+        log("boss list: " .. #bossList .. " entries (known table + found in Workspace)")
+        for _, boss in ipairs(bossList) do
+            if not on() then break end
+            boss.learned = boss.learned or {}
+            local skipReason = bossSkipReason(boss)
+            if skipReason then
+                log(boss.name .. ": " .. skipReason)
+            else
+                local rounds, probed, startFails = 0, false, 0
+                while on() and rounds < CFG.MaxRoundsPerBoss do
+                    local keys = allKeys(boss)
+                    local missing = missingDrops(boss)
+                    if #keys > 0 and #missing == 0 then
+                        log(boss.name .. ": all known drops owned, moving on")
+                        break
+                    end
+                    if #keys == 0 and probed then
+                        log(boss.name .. ": fought it once and still no drop key learned, skipping")
+                        break
+                    end
+                    rounds = rounds + 1
+                    probed = true
+                    log(string.format("%s: round %d, missing %s", boss.name, rounds,
+                        #missing > 0 and table.concat(missing, ", ") or "(unknown yet, probing to learn the drops)"))
+                    waitForChar(30)
+                    if startBoss(boss) then
+                        startFails = 0
+                        local _, giverPos = bossParts(boss)
+                        fightAndCollect(boss, giverPos)
+                    else
+                        startFails = startFails + 1
+                        if startFails >= 2 then
+                            log(boss.name .. ": could not start it twice in a row, moving on")
+                            break
+                        end
+                        task.wait(3)
+                    end
+                end
+            end
+        end
+        if on() then log("finished the bosses in this map") end
+
+        if on() and CFG.AutoHop then
+            local nextMaps = {}
+            for _, m in ipairs(readMaps()) do
+                if not visited[m.place] then nextMaps[#nextMaps + 1] = m end
+            end
+            if #nextMaps == 0 then
+                log("every map in the list has been visited, all done")
+            else
+                local names = {}
+                for _, m in ipairs(nextMaps) do names[#names + 1] = m.name end
+                log(#nextMaps .. " maps left: " .. table.concat(names, ", "))
+                for _, m in ipairs(nextMaps) do
+                    if not on() then break end
+                    visited[m.place] = true   -- also marks it done if the hop fails, so it is not retried
+                    log("hopping to the private server of " .. m.name)
+                    local fatal = hopTo(m.place, visited)
+                    if fatal == "fatal" then
+                        log("hopping cannot work right now (reason in the hop line above), stopping")
+                        break
+                    end
+                    if on() then log("the hop to " .. m.name .. " did not happen, trying the next map") end
+                end
+                if on() then log("no map could be entered, stopping") end
+            end
+        end
+        C.Stop()
+    end
+
+    return C
+end
+]==]
+
+function T3.collectorHub()
+    return {
+        Config = Config, State = State, T3 = T3, LocalPlayer = LocalPlayer, Players = Players,
+        Workspace = Workspace, RunService = RunService,
+        getRoot = getRoot, getBossHeight = getBossHeight, placeUnder = placeUnder,
+        pressKey = pressKey, clickM1 = clickM1, forceReleaseInputs = forceReleaseInputs,
+        startFly = startFly, stopFly = stopFly,
+        isAlive = function() return Alive end,
+    }
+end
+
+function T3.startCollector(resumeList)
+    if T3.collectorMod and T3.collectorMod.running then return end
+    State.Collector = true
+    Config.Collector.Status = "starting..."
+    local fn, err = loadstring(T3.collectorSource)
+    if not fn then
+        print("[EggzyCollector] could not compile: " .. tostring(err))
+        Config.Collector.Status = "could not compile: " .. tostring(err)
+        State.Collector = false
+        return
+    end
+    local okB, builder = pcall(fn)
+    local okM, mod
+    if okB and type(builder) == "function" then okM, mod = pcall(builder, T3.collectorHub()) end
+    if not (okM and type(mod) == "table") then
+        print("[EggzyCollector] could not start the module: " .. tostring(okB and mod or builder))
+        Config.Collector.Status = "could not start the module: " .. tostring(okB and mod or builder)
+        State.Collector = false
+        return
+    end
+    T3.collectorMod = mod
+    task.spawn(function()
+        local okR, errR = pcall(mod.Run, resumeList)
+        if not okR then
+            print("[EggzyCollector] stopped by an error: " .. tostring(errR))
+            Config.Collector.Status = "stopped by an error: " .. tostring(errR)
+            pcall(mod.Stop)
+        end
+    end)
+end
+
+function T3.stopCollector()
+    if T3.collectorMod then pcall(T3.collectorMod.Stop) end
+    State.Collector = false
+end
+
+-- Reads the hop state written by the module (EggzyCollectorResume.txt) and the getgenv flag the queued payload sets.
+-- Returns a list of place ids already visited, or nil when this is not a continuation after a hop.
+function T3.collectorTakeResume()
+    local okE, genv = pcall(getgenv)
+    local visited
+    if okE and genv and type(genv.EggzyCollectorResume) == "table" and type(genv.EggzyCollectorResume.visited) == "table" then
+        visited = genv.EggzyCollectorResume.visited
+        genv.EggzyCollectorResume = nil
+    end
+    local file = Config.Collector.ResumeFile
+    if isfile and readfile and isfile(file) then
+        local okR, txt = pcall(readfile, file)
+        if okR and type(txt) == "string" and not visited then
+            local ts, job, ids = txt:match("^(%d+)|([^|]*)|(.*)$")
+            ts = tonumber(ts)
+            if ts and math.abs(os.time() - ts) <= Config.Collector.ResumeWindow and job ~= tostring(game.JobId) then
+                visited = {}
+                for id in ids:gmatch("%d+") do visited[#visited + 1] = tonumber(id) end
+            end
+        end
+        if writefile then pcall(writefile, file, "0") end
+    end
+    return visited
+end
+
+function T3.collectorResume()
+    local visited = T3.collectorTakeResume()
+    if not visited then return end
+    print("[EggzyCollector] resuming after a hop, maps already done: " .. #visited)
+    T3.startCollector(visited)
+end
+
+do
+    local card, body = createCard(autoPage, "Boss Collector", 3)
+    createToggle(body, "Boss Collector", 1, function() return State.Collector == true end, function(v)
+        if v then T3.startCollector() else T3.stopCollector() end
+    end)
+    createToggle(body, "Hop to next map when done", 2, function() return Config.Collector.AutoHop end, function(v)
+        Config.Collector.AutoHop = v
+    end)
+    local lbl = Instance.new("TextLabel")
+    lbl.Name = "CollectorStatus"
+    lbl.Size = UDim2.new(1, 0, 0, 48)
+    lbl.BackgroundTransparency = 1
+    lbl.TextWrapped = true
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextYAlignment = Enum.TextYAlignment.Top
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 11
+    lbl.TextColor3 = Theme.TextDim
+    lbl.LayoutOrder = 3
+    lbl.Text = "status: idle"
+    lbl.Parent = body
+    task.spawn(function()
+        while lbl.Parent and Alive do
+            lbl.Text = "status: " .. tostring(Config.Collector.Status)
+            task.wait(0.5)
+        end
+    end)
+end
+
 do
     local card, body = createCard(autoPage, "Quest & Farm", 1)
     createToggle(body, "Money Grind", 3, function() return State.Grind end, function(v)
@@ -4474,6 +5222,7 @@ Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 5)
 closeBtn.MouseButton1Click:Connect(function()
     Alive = false
     State.Mentor = false
+    pcall(T3.stopCollector)
     pcall(function() RunService:UnbindFromRenderStep("EggzyFullbright") end)
     pcall(T3.fbRestore)
     pcall(stopFaceLock)
@@ -4498,4 +5247,5 @@ closeBtn.MouseButton1Click:Connect(function()
     print("[EggzyHub] Unloaded completely.")
 end)
 
+pcall(T3.collectorResume)
 print("[EggzyHub] Loaded successfully.")
