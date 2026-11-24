@@ -1,3 +1,6 @@
+-- EggzyHubSolo.lua: the whole EggzyHub carried inside this one file, so it can queue itself after a server teleport
+-- (same idea as your auto-relog script, whose payload is a string inside itself). Run THIS file; nothing else is needed.
+getgenv().EggzyHubSourceText = [[
 -- ============================================================================
 -- EggzyHub.lua (client-side Luau) — Full Production Build (Optimized & Cleaned)
 -- Updated: Strict boundary-detection with non-overlapping Y ranges for all regions.
@@ -84,10 +87,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.163-collector",
+    BuildNote = "v1.7.164-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 163 },
+    Version = { Tweaks = 164 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3791,7 +3794,7 @@ end
 
 -- ===================== BOSS COLLECTOR =====================
 -- Toggle on the Auto page. For every boss giver in the map it is standing in (Workspace.<folder>.missions.<boss>.missiongiver.CLIENTTALK):
--- skip it if you already own its drops, otherwise talk to the giver, go UNDER the boss (the Money Grind height, placeUnder), leave Instant Kill on and
+-- skip it if you already own its drops, otherwise talk to the giver, go ABOVE the boss (FightHeight, camera straight down), leave Instant Kill on and
 -- press Q every QEvery seconds; when a scroll drops, teleport on top of it, look straight down, M1 and Q every 5 s. When the map is done it goes
 -- to the private server of the next map (startevent:FireServer("createprivateserver", place id), captured with WrenchSpyLite) and the hub reloads
 -- itself there (same queue_on_teleport loader the Mentor uses) and carries on.
@@ -3801,6 +3804,8 @@ Config.Collector = {
     QEvery = 5,                  -- from you: Q every 5 seconds (fight and scroll pickup)
     Step = 0.25,
     HeightAboveScroll = 3,       -- uncalibrated
+    FightHeight = 10,            -- studs ABOVE the boss while fighting (camera looks straight down at it). Uncalibrated, raise it if the boss still hits you
+    FightQEvery = 0.3,           -- Q is pressed this often for as long as the boss is alive (Hub.pressKey itself skips a press while one is still held)
     ClickFallbackAfter = 4,      -- seconds of M1 before fireclickdetector is tried
     ScrollGiveUp = 14,           -- seconds on one scroll before moving on (uncalibrated)
     TalkRetries = 4,
@@ -3912,15 +3917,19 @@ return function(Hub)
         end
     end
 
-    local function lockCameraDown(targetPart)
+    local lookTarget, lookHeight
+    local function lockCameraDown(targetPart, camHeight)
+        lookTarget = targetPart
+        lookHeight = camHeight or (CFG.HeightAboveScroll + 2)
         if lookOn then return end
         local cam = Workspace.CurrentCamera
         if not cam then return end
         lookOn = true
         RunService:BindToRenderStep(LOOK_NAME, Enum.RenderPriority.Camera.Value + 1, function()
-            if targetPart and targetPart.Parent then
-                local from = targetPart.Position + Vector3.new(0, CFG.HeightAboveScroll + 2, 0)
-                cam.CFrame = CFrame.lookAt(from, targetPart.Position, Vector3.new(0, 0, -1))
+            local t = lookTarget
+            if t and t.Parent then
+                local from = t.Position + Vector3.new(0, lookHeight, 0)
+                cam.CFrame = CFrame.lookAt(from, t.Position, Vector3.new(0, 0, -1))
             end
         end)
     end
@@ -4195,11 +4204,11 @@ return function(Hub)
             entry.model.Parent and "still there when giving up" or "gone", #added > 0 and table.concat(added, ", ") or "none"))
     end
 
-    -- under the boss (the hub's Money Grind height), Instant Kill on, Q every QEvery seconds; then the scrolls
+    -- ABOVE the boss, camera straight down at it, Instant Kill on, Q pressed continuously until the boss is dead; then the scrolls
     local function fightAndCollect(boss, giverPos)
         local t0 = os.clock()
         local quiet, lastQ = 0, 0
-        local height = Hub.getBossHeight(boss.name)
+        local height = CFG.FightHeight
         while on() and os.clock() - t0 < CFG.FightTimeout do
             ensureFarmState()
             local _, hum = Hub.getRoot()
@@ -4216,11 +4225,12 @@ return function(Hub)
                 local bd = b.model:FindFirstChild("bossdrop")
                 if bd and bd:IsA("StringValue") then learn(boss, bd.Value, "live npc " .. b.model.Name) end
                 Hub.placeUnder(b.part, height)
-                if os.clock() - lastQ >= CFG.QEvery then
+                lockCameraDown(b.part, height + 2)
+                if os.clock() - lastQ >= CFG.FightQEvery then
                     lastQ = os.clock()
                     pressQ()
                 end
-                task.wait(CFG.Step)
+                task.wait(math.min(CFG.Step, CFG.FightQEvery))
             else
                 local scrolls = findScrolls()
                 if #scrolls > 0 then
@@ -4228,12 +4238,14 @@ return function(Hub)
                     learn(boss, scrolls[1].model.Name, "dropped scroll model")
                     pickUp(scrolls[1])
                 else
+                    unlockCamera()
                     quiet = quiet + CFG.Step
                     task.wait(CFG.Step)
                 end
             end
             if quiet >= CFG.QuietExit then break end
         end
+        unlockCamera()
     end
 
     -- combat bug: incombat stays true with no boss and no scroll
@@ -5309,3 +5321,6 @@ end)
 
 pcall(T3.collectorResume)
 print("[EggzyHub] Loaded successfully.")
+
+]]
+loadstring(getgenv().EggzyHubSourceText)()
