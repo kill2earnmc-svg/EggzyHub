@@ -1,3 +1,6 @@
+-- EggzyHubSolo.lua: the whole EggzyHub carried inside this one file, so it can queue itself after a server teleport
+-- (same idea as your auto-relog script, whose payload is a string inside itself). Run THIS file; nothing else is needed.
+getgenv().EggzyHubSourceText = [[
 -- ============================================================================
 -- EggzyHub.lua (client-side Luau) — Full Production Build (Optimized & Cleaned)
 -- Updated: Strict boundary-detection with non-overlapping Y ranges for all regions.
@@ -84,10 +87,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.166-collector",
+    BuildNote = "v1.7.167-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 166 },
+    Version = { Tweaks = 167 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -4229,7 +4232,7 @@ return function(Hub)
         return true
     end
 
-    -- ABOVE the boss, camera straight down at it, Instant Kill on, Q pressed continuously until the boss is dead; then the scrolls
+    -- ABOVE the boss, camera straight down at it, the hub's Instant Kill hit fired on the boss every step, Q pressed continuously until the boss is dead; then the scrolls
     local function fightAndCollect(boss, giverPos)
         local t0 = os.clock()
         local quiet, lastQ, lastDiag, lastBossName = 0, 0, 0, nil
@@ -4268,6 +4271,8 @@ return function(Hub)
                         tostring(State.Fly), tostring(State.Kill), tostring(State.ScrollTrip)))
                 end
                 lockCameraDown(b.part, height + 2)
+                Hub.keepAlive()
+                Hub.instantKill(b.hum, b.part)
                 if os.clock() - lastQ >= CFG.FightQEvery then
                     lastQ = os.clock()
                     pressQ()
@@ -4558,6 +4563,29 @@ function T3.collectorHub()
         pressKey = pressKey, clickM1 = clickM1, forceReleaseInputs = forceReleaseInputs,
         startFly = startFly, stopFly = stopFly,
         isAlive = function() return Alive end,
+        -- the same hit as the hub's Instant Kill loop and the Money Grind: startevent:FireServer("target", part) plus Health = 0 / TakeDamage on the client
+        instantKill = function(hum, part)
+            local r = Config.Kill.UseHitRemote and LocalPlayer:FindFirstChild(Config.Kill.RemoteName)
+            if r and r:IsA("BaseRemoteEvent") and part then pcall(r.FireServer, r, "target", part) end
+            if hum and hum.Health > 0 then
+                scriptZeroed[hum] = true
+                pcall(function()
+                    hum.Health = 0
+                    local maxHp = tonumber(hum.MaxHealth)
+                    if maxHp then hum:TakeDamage(maxHp) end
+                end)
+            end
+        end,
+        -- the Money Grind keeps your own health topped up while it fights, same here
+        keepAlive = function()
+            local _, h = getRoot()
+            if h then
+                pcall(function()
+                    if h.MaxHealth < 300000 then h.MaxHealth = 300000 end
+                    h.Health = 300000
+                end)
+            end
+        end,
     }
 end
 
@@ -5371,3 +5399,6 @@ end)
 
 pcall(T3.collectorResume)
 print("[EggzyHub] Loaded successfully.")
+
+]]
+loadstring(getgenv().EggzyHubSourceText)()
