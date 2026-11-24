@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.162-collector",
+    BuildNote = "v1.7.163-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 162 },
+    Version = { Tweaks = 163 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -2308,7 +2308,8 @@ function T3.findReloadLoader()
     local okE, genv = pcall(getgenv)
     local url = okE and genv and genv.EggzyHubReloadUrl
     if type(url) == "string" and url ~= "" then
-        T3.loader, T3.loaderNote = string.format("loadstring(game:HttpGet(%q))()", url), "url"
+        -- the reloaded hub must know its own reload source too, otherwise the NEXT hop finds none
+        T3.loader, T3.loaderNote = string.format("getgenv().EggzyHubReloadUrl = %q\nloadstring(game:HttpGet(%q))()", url, url), "url"
         return T3.loader, T3.loaderNote
     end
     -- Best source: the full hub text carried inside the file that launched it (EggzyHubSolo.lua).
@@ -2323,7 +2324,7 @@ function T3.findReloadLoader()
         return T3.loader, T3.loaderNote
     end
     local function viaFile(name)
-        return string.format("loadstring(readfile(%q))()", name)
+        return string.format("getgenv().EggzyHubReloadFile = %q\nloadstring(readfile(%q))()", name, name)
     end
     if isfile and readfile then
         local named = (okE and genv and genv.EggzyHubReloadFile) or t.ReloadFile
