@@ -1,6 +1,3 @@
--- EggzyHubSolo.lua: the whole EggzyHub carried inside this one file, so it can queue itself after a server teleport
--- (same idea as your auto-relog script, whose payload is a string inside itself). Run THIS file; nothing else is needed.
-getgenv().EggzyHubSourceText = [[
 -- ============================================================================
 -- EggzyHub.lua (client-side Luau) — Full Production Build (Optimized & Cleaned)
 -- Updated: Strict boundary-detection with non-overlapping Y ranges for all regions.
@@ -87,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.165-collector",
+    BuildNote = "v1.7.166-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 165 },
+    Version = { Tweaks = 166 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3822,6 +3819,9 @@ Config.Collector = {
     -- from you: no tailed beasts. Any boss, folder or live npc name containing one of these is never fought. The beast names come from the
     -- ReplicatedStorage.bosses template list in your WrenchMapScan paste.
     ExcludeNames = { "tail", "gyuki", "isobu", "kokuo", "kurama", "matabi", "saiken", "shukaku", "son goku", "songoku", "chomei" },
+    -- Workspace folders whose missions are never touched. "sensei" is where your Auto Mentor talks to Bruce Kenichi
+    -- (Workspace.sensei.missions.Bruce Kenichi.missiongiver.CLIENTTALK); the mentors share names with roster bosses, so without this the collector talked to them.
+    ExcludeRoots = { "sensei" },
     OnlyRoster = true,           -- ONLY bosses named in OnlyNames are fought. This is what keeps Hollow and other non-boss missions out
     OnlyNames = {                -- your own 43 boss names
         "Ailee Minakami", "Alphirama Dangan", "Apollo Sabaku", "Arahaki Jokei", "Ashen Storm", "Azim Senko", "Bankai Akuma",
@@ -4003,8 +4003,17 @@ return function(Hub)
         return false
     end
 
+    local function rootExcluded(rootName)
+        local r = string.lower(tostring(rootName))
+        for _, bad in ipairs(CFG.ExcludeRoots or {}) do
+            if r == string.lower(bad) then return true end
+        end
+        local mp = Config.Mentor and Config.Mentor.RootPath
+        return mp ~= nil and mp[1] ~= nil and r == string.lower(mp[1])
+    end
+
     local function excluded(boss)
-        return nameExcluded(boss.name .. " " .. boss.root)
+        return rootExcluded(boss.root) or nameExcluded(boss.name .. " " .. boss.root)
     end
 
     local function norm(s)
@@ -4069,7 +4078,7 @@ return function(Hub)
             seen[b.root .. "/" .. b.name] = true
         end
         for _, root in ipairs(Workspace:GetChildren()) do
-            local missions = root:FindFirstChild("missions")
+            local missions = (not rootExcluded(root.Name)) and root:FindFirstChild("missions") or nil
             if missions then
                 for _, m in ipairs(missions:GetChildren()) do
                     local giver = m:FindFirstChild("missiongiver")
@@ -4093,6 +4102,7 @@ return function(Hub)
     end
 
     local function bossSkipReason(boss)
+        if rootExcluded(boss.root) then return "lives in the mentor folder (" .. boss.root .. "), never talked to by the collector, skipping" end
         if excluded(boss) then return "excluded by name (tailed beast), skipping" end
         if not onRoster(boss) then return "not on your boss list (OnlyRoster), skipping" end
         local talk = bossParts(boss)
@@ -5361,6 +5371,3 @@ end)
 
 pcall(T3.collectorResume)
 print("[EggzyHub] Loaded successfully.")
-
-]]
-loadstring(getgenv().EggzyHubSourceText)()
