@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.161-collector",
+    BuildNote = "v1.7.162-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 161 },
+    Version = { Tweaks = 162 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3826,7 +3826,8 @@ Config.Collector = {
         "Satoru Okami", "Sengoku", "Shiba Glacier", "Shindai Akuma", "Shiver Akuma", "Tengoku", "Xeno Dokei",
     },
     SkipMaps = { "none" },       -- map buttons never visited. "none" (place 590798306) looks like a placeholder: UNVERIFIED
-    TrustNameMatch = true,       -- unknown-drop boss is skipped if you own <name>BOSS / <name>2ndStage / <name>CHAR (HEURISTIC)
+    TrustNameMatch = false,      -- legacy name guess, stays OFF. Ownership now comes from the companion catalog (alljutsu.companions) checked against statz.unlocked
+    NoProgressRounds = 15,       -- rounds in a row with the same missing keys before it moves on to the next boss
     ResumeFile = "EggzyCollectorResume.txt",
     ResumeWindow = 300,
     Status = "idle",
@@ -4010,6 +4011,32 @@ return function(Hub)
         return rosterSet[norm(boss.name)] == true
     end
 
+    -- ------------------------------------------------------------ companion catalog (from your WrenchBossDropScan paste)
+    -- ReplicatedStorage.alljutsu.companions holds one ModuleScript per companion, named <boss>BOSS, each with a REALNAME StringValue
+    -- (for example riserakumaBOSS has REALNAME "Riser Akuma"). Owned means the same name exists in statz.unlocked, which is the check the scan used.
+    -- Matching a boss to its companion goes by REALNAME first, then by the key without its BOSS suffix. UNVERIFIED: that killing the boss is what awards it.
+    local companionIndex
+    local function companionKeyFor(boss)
+        if not companionIndex then
+            companionIndex = {}
+            local aj = game:GetService("ReplicatedStorage"):FindFirstChild("alljutsu")
+            local cf = aj and aj:FindFirstChild("companions")
+            if cf then
+                for _, c in ipairs(cf:GetChildren()) do
+                    if c:IsA("ModuleScript") then
+                        local rn = c:FindFirstChild("REALNAME")
+                        if rn and rn:IsA("StringValue") and rn.Value ~= "" then
+                            companionIndex[norm(rn.Value)] = c.Name
+                        end
+                        local base = (string.gsub(c.Name, "BOSS$", ""))
+                        if companionIndex[norm(base)] == nil then companionIndex[norm(base)] = c.Name end
+                    end
+                end
+            end
+        end
+        return companionIndex[norm(boss.name)]
+    end
+
     local function bossParts(boss)
         local root = Workspace:FindFirstChild(boss.root)
         local missions = root and root:FindFirstChild("missions")
@@ -4041,6 +4068,15 @@ return function(Hub)
                         list[#list + 1] = { name = m.Name, root = root.Name, drops = nil }
                     end
                 end
+            end
+        end
+        for _, boss in ipairs(list) do
+            local ck = companionKeyFor(boss)
+            if ck then
+                boss.drops = boss.drops or {}
+                local have = false
+                for _, k in ipairs(boss.drops) do if k == ck then have = true end end
+                if not have then boss.drops[#boss.drops + 1] = ck end
             end
         end
         return list
@@ -4301,6 +4337,8 @@ return function(Hub)
                 pcall(q, code)   -- some executors keep only the last queued script
             end
         end
+        -- still here = the hop did not happen: drop the resume flag so a later unrelated teleport (the Mentor's fight server) does not start the collector
+        if writefile then pcall(writefile, CFG.ResumeFile, "0") end
     end
 
     -- ------------------------------------------------------------ run / stop
@@ -4355,6 +4393,17 @@ return function(Hub)
 
         local bossList = buildBossList()
         log("boss list: " .. #bossList .. " entries (known table + found in Workspace)")
+        do
+            local have, miss = 0, {}
+            for _, boss in ipairs(bossList) do
+                local ck = companionKeyFor(boss)
+                if ck then
+                    if owned(ck) then have = have + 1 else miss[#miss + 1] = ck end
+                end
+            end
+            log(string.format("companions in this map: %d owned, %d missing%s", have, #miss,
+                #miss > 0 and (" (" .. table.concat(miss, ", ") .. ")") or ""))
+        end
         for _, boss in ipairs(bossList) do
             if not on() then break end
             boss.learned = boss.learned or {}
@@ -4363,6 +4412,7 @@ return function(Hub)
                 log(boss.name .. ": " .. skipReason)
             else
                 local rounds, probed, startFails = 0, false, 0
+                local lastSig, sameRounds = nil, 0
                 while on() and rounds < CFG.MaxRoundsPerBoss do
                     local keys = allKeys(boss)
                     local missing = missingDrops(boss)
@@ -4373,6 +4423,15 @@ return function(Hub)
                     if #keys == 0 and probed then
                         log(boss.name .. ": fought it once and still no drop key learned, skipping")
                         break
+                    end
+                    if #missing > 0 then
+                        local sig = table.concat(missing, ",")
+                        if sig == lastSig then sameRounds = sameRounds + 1 else sameRounds = 0 end
+                        lastSig = sig
+                        if sameRounds >= CFG.NoProgressRounds then
+                            log(boss.name .. ": " .. CFG.NoProgressRounds .. " rounds with no new drop, moving on")
+                            break
+                        end
                     end
                     rounds = rounds + 1
                     probed = true
