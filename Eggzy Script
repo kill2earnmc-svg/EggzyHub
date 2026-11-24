@@ -87,10 +87,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.167-collector",
+    BuildNote = "v1.7.168-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 167 },
+    Version = { Tweaks = 168 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3804,7 +3804,8 @@ Config.Collector = {
     QEvery = 5,                  -- from you: Q every 5 seconds (fight and scroll pickup)
     Step = 0.25,
     HeightAboveScroll = 3,       -- uncalibrated
-    FightHeight = 10,            -- studs ABOVE the boss while fighting (camera looks straight down at it). Uncalibrated, raise it if the boss still hits you
+    FightHeight = 15,            -- from you: 15 studs ABOVE the boss while fighting (camera looks straight down at it)
+    FirstQLead = 0.35,           -- seconds Q is given to start before the first kill hit on a boss (uncalibrated)
     FightQEvery = 0.3,           -- Q is pressed this often for as long as the boss is alive (Hub.pressKey itself skips a press while one is still held)
     ClickFallbackAfter = 4,      -- seconds of M1 before fireclickdetector is tried
     ScrollGiveUp = 14,           -- seconds on one scroll before moving on (uncalibrated)
@@ -4236,6 +4237,7 @@ return function(Hub)
     local function fightAndCollect(boss, giverPos)
         local t0 = os.clock()
         local quiet, lastQ, lastDiag, lastBossName = 0, 0, 0, nil
+        local qCount = 0
         local height = CFG.FightHeight
         local lastErr
         while on() and os.clock() - t0 < CFG.FightTimeout do
@@ -4266,17 +4268,20 @@ return function(Hub)
                 local moved, why = goAbove(b.part, height)
                 if os.clock() - lastDiag >= 2 then
                     lastDiag = os.clock()
-                    log(string.format("fight: boss %.0f studs away before the move, moved=%s%s, hp %.0f, Fly=%s Kill=%s ScrollTrip=%s",
-                        distBefore or -1, tostring(moved), why and (" (" .. why .. ")") or "", b.hum.Health,
+                    log(string.format("fight: boss %.0f studs away before the move, moved=%s%s, hp %.0f, Q presses %d, Fly=%s Kill=%s ScrollTrip=%s",
+                        distBefore or -1, tostring(moved), why and (" (" .. why .. ")") or "", b.hum.Health, qCount,
                         tostring(State.Fly), tostring(State.Kill), tostring(State.ScrollTrip)))
                 end
                 lockCameraDown(b.part, height + 2)
                 Hub.keepAlive()
-                Hub.instantKill(b.hum, b.part)
+                -- Q first, then the kill hit, so the boss cannot die before a single Q went out
                 if os.clock() - lastQ >= CFG.FightQEvery then
                     lastQ = os.clock()
+                    qCount = qCount + 1
                     pressQ()
+                    if qCount == 1 then task.wait(CFG.FirstQLead) end
                 end
+                Hub.instantKill(b.hum, b.part)
                 task.wait(math.min(CFG.Step, CFG.FightQEvery))
             else
                 local scrolls = findScrolls()
