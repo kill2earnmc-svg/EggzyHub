@@ -87,10 +87,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.169-collector",
+    BuildNote = "v1.7.172-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 169 },
+    Version = { Tweaks = 172 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3804,7 +3804,7 @@ Config.Collector = {
     QEvery = 5,                  -- from you: Q every 5 seconds (fight and scroll pickup)
     Step = 0.25,
     HeightAboveScroll = 3,       -- uncalibrated
-    FightHeight = 15,            -- from you: 15 studs ABOVE the boss while fighting (camera looks straight down at it)
+    FightHeight = 35,            -- from you: 35 studs ABOVE the boss while fighting (camera looks straight down at it)
     QHold = 0.12,                -- seconds the Q key is held per press (the hub's own grind uses 0.05, which a real keypress can miss). Uncalibrated
     KillGrace = 6,               -- a boss whose Health the Instant Kill zeroed locally still counts as alive this many seconds, the server decides whether it really died
     FirstQLead = 0.35,           -- seconds Q is given to start before the first kill hit on a boss (uncalibrated)
@@ -3839,6 +3839,8 @@ Config.Collector = {
     },
     SkipMaps = { "none" },       -- map buttons never visited. "none" (place 590798306) looks like a placeholder: UNVERIFIED
     TrustNameMatch = false,      -- legacy name guess, stays OFF. Ownership now comes from the companion catalog (alljutsu.companions) checked against statz.unlocked
+    StayUntilOwned = true,       -- from you: never leave a map until every drop of its bosses is owned. false = the old behaviour (give up after NoProgressRounds / start failures)
+    RetryPause = 8,              -- seconds to wait before trying again when a boss would not start or gave nothing new
     NoProgressRounds = 15,       -- rounds in a row with the same missing keys before it moves on to the next boss
     ResumeFile = "EggzyCollectorResume.txt",
     ResumeWindow = 300,
@@ -3863,6 +3865,7 @@ return function(Hub)
     local LOOK_NAME = "EggzyCollectorLook"
     local lookOn = false
     local changed = {}   -- State flags this module turned on, restored on Stop
+    local busy, lastActivity = false, os.clock()   -- busy = talking to a giver or hopping; lastActivity = last time a boss or scroll was in play. The reset watchdog stays out while busy or right after activity
     local killWasOn = false  -- the hub's background Instant Kill loop is held OFF while the collector runs: it killed the boss from the giver before you were above it and before any Q went out
 
     local function log(msg)
@@ -3962,13 +3965,26 @@ return function(Hub)
         return u ~= nil and u:FindFirstChild(key) ~= nil
     end
 
+    -- a learned key (bossdrop value or scroll model name) only counts as something to wait for when it is a real entry of a game catalog or already in your
+    -- unlocked list; otherwise a wrong guess would keep the collector in one map forever
+    local function knownKey(key)
+        if owned(key) then return true end
+        local aj = game:GetService("ReplicatedStorage"):FindFirstChild("alljutsu")
+        if not aj then return false end
+        for _, folder in ipairs({ "companions", "BOSSDROPS", "subjutsu", "Acharacterpowers" }) do
+            local f = aj:FindFirstChild(folder)
+            if f and f:FindFirstChild(key) then return true end
+        end
+        return false
+    end
+
     local function allKeys(boss)
         local keys, seen = {}, {}
         for _, k in ipairs(boss.drops or {}) do
             if not seen[k] then seen[k] = true keys[#keys + 1] = k end
         end
         for _, k in ipairs(boss.learned or {}) do
-            if not seen[k] then seen[k] = true keys[#keys + 1] = k end
+            if not seen[k] and knownKey(k) then seen[k] = true keys[#keys + 1] = k end
         end
         return keys
     end
@@ -4165,7 +4181,7 @@ return function(Hub)
     end
 
     -- ------------------------------------------------------------ actions
-    local function startBoss(boss)
+    local function startBossInner(boss)
         local talk, giverPos = bossParts(boss)
         if not (talk and talk:IsA("RemoteEvent") and giverPos) then
             log(boss.name .. ": giver or CLIENTTALK not found, skipping")
@@ -4186,6 +4202,15 @@ return function(Hub)
         end
         log(boss.name .. ": no boss appeared after " .. CFG.TalkRetries .. " tries")
         return false
+    end
+
+    local function startBoss(boss)
+        busy = true
+        local ok, res = pcall(startBossInner, boss)
+        busy = false
+        lastActivity = os.clock()
+        if not ok then log("startBoss error: " .. tostring(res)) return false end
+        return res
     end
 
     -- teleport on top of the scroll, camera straight down, M1, Q every QEvery seconds
@@ -4266,6 +4291,7 @@ return function(Hub)
             end
             if b then
                 quiet = 0
+                lastActivity = os.clock()
                 local bd = b.model:FindFirstChild("bossdrop")
                 if bd and bd:IsA("StringValue") then learn(boss, bd.Value, "live npc " .. b.model.Name) end
                 if lastBossName ~= b.model.Name then
@@ -4297,6 +4323,7 @@ return function(Hub)
                 local scrolls = findScrolls()
                 if #scrolls > 0 then
                     quiet = 0
+                    lastActivity = os.clock()
                     learn(boss, scrolls[1].model.Name, "dropped scroll model")
                     pickUp(scrolls[1])
                 else
@@ -4327,13 +4354,14 @@ return function(Hub)
                 local ic = LocalPlayer:FindFirstChild("incombat")
                 local root = getChar()
                 local stuck = false
-                if ic and ic.Value == true and root and not livingBoss(root.Position) and #findScrolls() == 0 then
+                if ic and ic.Value == true and root and not busy and os.clock() - lastActivity >= 5
+                    and not livingBoss(root.Position) and #findScrolls() == 0 then
                     stuck = true
                 end
                 if stuck then
                     stuckSince = stuckSince or os.clock()
                     if os.clock() - stuckSince >= CFG.CombatStuckSeconds then
-                        log("combat bug: incombat stayed true with no boss and no scroll, resetting the character")
+                        log("combat bug: incombat stayed true " .. CFG.CombatStuckSeconds .. "s with no boss and no scroll, resetting the character")
                         stuckSince = nil
                         unlockCamera()
                         local c = LocalPlayer.Character
@@ -4393,7 +4421,7 @@ return function(Hub)
     end
 
     -- returns only when the hop did NOT happen (a successful teleport ends the old server's script); "fatal" = no hop can ever work this session
-    local function hopTo(place, visitedSet)
+    local function hopToInner(place, visitedSet)
         local startevent = LocalPlayer:FindFirstChild("startevent")
         local passes = LocalPlayer:FindFirstChild("gamepasses")
         if not (startevent and startevent:IsA("BaseRemoteEvent")) then log("hop: startevent not found") return "fatal" end
@@ -4422,6 +4450,15 @@ return function(Hub)
         end
         -- still here = the hop did not happen: drop the resume flag so a later unrelated teleport (the Mentor's fight server) does not start the collector
         if writefile then pcall(writefile, CFG.ResumeFile, "0") end
+    end
+
+    local function hopTo(place, visitedSet)
+        busy = true
+        local ok, res = pcall(hopToInner, place, visitedSet)
+        busy = false
+        lastActivity = os.clock()
+        if not ok then log("hop error: " .. tostring(res)) return "fatal" end
+        return res
     end
 
     -- ------------------------------------------------------------ run / stop
@@ -4497,7 +4534,7 @@ return function(Hub)
             else
                 local rounds, probed, startFails = 0, false, 0
                 local lastSig, sameRounds = nil, 0
-                while on() and rounds < CFG.MaxRoundsPerBoss do
+                while on() and (CFG.StayUntilOwned or rounds < CFG.MaxRoundsPerBoss) do
                     local keys = allKeys(boss)
                     local missing = missingDrops(boss)
                     if #keys > 0 and #missing == 0 then
@@ -4513,8 +4550,14 @@ return function(Hub)
                         if sig == lastSig then sameRounds = sameRounds + 1 else sameRounds = 0 end
                         lastSig = sig
                         if sameRounds >= CFG.NoProgressRounds then
-                            log(boss.name .. ": " .. CFG.NoProgressRounds .. " rounds with no new drop, moving on")
-                            break
+                            if CFG.StayUntilOwned then
+                                log(boss.name .. ": " .. CFG.NoProgressRounds .. " rounds with no new drop, staying in this map anyway (StayUntilOwned). Still missing: " .. sig)
+                                sameRounds = 0
+                                task.wait(CFG.RetryPause)
+                            else
+                                log(boss.name .. ": " .. CFG.NoProgressRounds .. " rounds with no new drop, moving on")
+                                break
+                            end
                         end
                     end
                     rounds = rounds + 1
@@ -4529,8 +4572,14 @@ return function(Hub)
                     else
                         startFails = startFails + 1
                         if startFails >= 2 then
-                            log(boss.name .. ": could not start it twice in a row, moving on")
-                            break
+                            if CFG.StayUntilOwned then
+                                log(boss.name .. ": could not start it twice in a row, waiting " .. CFG.RetryPause .. "s and trying again (StayUntilOwned)")
+                                startFails = 0
+                                task.wait(CFG.RetryPause)
+                            else
+                                log(boss.name .. ": could not start it twice in a row, moving on")
+                                break
+                            end
                         end
                         task.wait(3)
                     end
