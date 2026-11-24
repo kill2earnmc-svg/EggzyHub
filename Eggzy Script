@@ -87,10 +87,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.168-collector",
+    BuildNote = "v1.7.169-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 168 },
+    Version = { Tweaks = 169 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3805,6 +3805,8 @@ Config.Collector = {
     Step = 0.25,
     HeightAboveScroll = 3,       -- uncalibrated
     FightHeight = 15,            -- from you: 15 studs ABOVE the boss while fighting (camera looks straight down at it)
+    QHold = 0.12,                -- seconds the Q key is held per press (the hub's own grind uses 0.05, which a real keypress can miss). Uncalibrated
+    KillGrace = 6,               -- a boss whose Health the Instant Kill zeroed locally still counts as alive this many seconds, the server decides whether it really died
     FirstQLead = 0.35,           -- seconds Q is given to start before the first kill hit on a boss (uncalibrated)
     FightQEvery = 0.3,           -- Q is pressed this often for as long as the boss is alive (Hub.pressKey itself skips a press while one is still held)
     ClickFallbackAfter = 4,      -- seconds of M1 before fireclickdetector is tried
@@ -3861,6 +3863,7 @@ return function(Hub)
     local LOOK_NAME = "EggzyCollectorLook"
     local lookOn = false
     local changed = {}   -- State flags this module turned on, restored on Stop
+    local killWasOn = false  -- the hub's background Instant Kill loop is held OFF while the collector runs: it killed the boss from the giver before you were above it and before any Q went out
 
     local function log(msg)
         CFG.Status = msg   -- shown live under the toggle
@@ -3898,11 +3901,15 @@ return function(Hub)
 
     -- fly + noclip + instant kill are the hub's own switches (the Money Grind turns the same ones on)
     local function ensureFarmState()
-        for _, name in ipairs({ "Fly", "Noclip", "Kill" }) do
+        for _, name in ipairs({ "Fly", "Noclip" }) do
             if not State[name] then
                 State[name] = true
                 changed[name] = true
             end
+        end
+        if State.Kill then
+            killWasOn = true
+            State.Kill = false
         end
         local root = getChar()
         if root and State.Fly then
@@ -3940,7 +3947,7 @@ return function(Hub)
 
     local function pressQ()
         task.spawn(function()
-            Hub.pressKey(Config.Grind.Key, Config.Grind.KeyHold, true)
+            Hub.pressKey(Config.Grind.Key, CFG.QHold, true)
         end)
     end
 
@@ -4119,6 +4126,7 @@ return function(Hub)
 
     -- ------------------------------------------------------------ boss and scroll queries
     -- nearest living model in Workspace.npc to `ref`, a model that carries a bossdrop value wins over one that does not
+    local killStart = setmetatable({}, { __mode = "k" })   -- model -> os.clock() of our first kill hit on it
     local function livingBoss(ref)
         local folder = Workspace:FindFirstChild("npc")
         if not folder then return nil end
@@ -4127,7 +4135,8 @@ return function(Hub)
             if m:IsA("Model") and m ~= LocalPlayer.Character and not nameExcluded(m.Name) then
                 local hum = m:FindFirstChildOfClass("Humanoid")
                 local part = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Head")
-                if hum and part and hum.Health > 0 then
+                local zeroedRecently = killStart[m] ~= nil and os.clock() - killStart[m] < CFG.KillGrace
+                if hum and part and (hum.Health > 0 or zeroedRecently) then
                     local d = (part.Position - ref).Magnitude
                     if d <= CFG.KillRange then
                         local score = d - (m:FindFirstChild("bossdrop") and 100000 or 0)
@@ -4281,6 +4290,7 @@ return function(Hub)
                     pressQ()
                     if qCount == 1 then task.wait(CFG.FirstQLead) end
                 end
+                killStart[b.model] = killStart[b.model] or os.clock()
                 Hub.instantKill(b.hum, b.part)
                 task.wait(math.min(CFG.Step, CFG.FightQEvery))
             else
@@ -4422,6 +4432,7 @@ return function(Hub)
         for name in pairs(changed) do State[name] = false end
         if changed.Fly then pcall(Hub.stopFly) end
         changed = {}
+        if killWasOn then State.Kill = true killWasOn = false end
         State.Collector = false
         CFG.Status = "STOPPED. last: " .. tostring(CFG.Status)
     end
@@ -4526,7 +4537,15 @@ return function(Hub)
                 end
             end
         end
-        if on() then log("finished the bosses in this map") end
+        if on() then
+            local left = {}
+            for _, boss in ipairs(bossList) do
+                if not bossSkipReason(boss) and #missingDrops(boss) > 0 then
+                    left[#left + 1] = boss.name .. " (" .. table.concat(missingDrops(boss), ", ") .. ")"
+                end
+            end
+            log("finished the bosses in this map" .. (#left > 0 and (", still missing drops from: " .. table.concat(left, "; ")) or ", every drop it knows of in this map is owned"))
+        end
 
         if on() and CFG.AutoHop then
             local nextMaps = {}
