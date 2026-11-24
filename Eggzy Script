@@ -87,10 +87,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.164-collector",
+    BuildNote = "v1.7.165-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 164 },
+    Version = { Tweaks = 165 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -4204,12 +4204,29 @@ return function(Hub)
             entry.model.Parent and "still there when giving up" or "gone", #added > 0 and table.concat(added, ", ") or "none"))
     end
 
+    -- own teleport above the boss (does not depend on the hub's ScrollTrip gate); returns false plus a reason when it could not move you
+    local function goAbove(part, height)
+        local root, hum = getChar()
+        if not root then return false, "no living character" end
+        if not (part and part.Parent) then return false, "boss part is gone" end
+        local target = part.Position + Vector3.new(0, height, 0)
+        local ok, err = pcall(function()
+            root.CFrame = CFrame.new(target)
+            root.AssemblyLinearVelocity = Vector3.zero
+            if hum then hum.PlatformStand = Hub.State.Fly == true end
+        end)
+        if not ok then return false, tostring(err) end
+        return true
+    end
+
     -- ABOVE the boss, camera straight down at it, Instant Kill on, Q pressed continuously until the boss is dead; then the scrolls
     local function fightAndCollect(boss, giverPos)
         local t0 = os.clock()
-        local quiet, lastQ = 0, 0
+        local quiet, lastQ, lastDiag, lastBossName = 0, 0, 0, nil
         local height = CFG.FightHeight
+        local lastErr
         while on() and os.clock() - t0 < CFG.FightTimeout do
+          local okIter, errIter = pcall(function()
             ensureFarmState()
             local _, hum = Hub.getRoot()
             if not (hum and hum.Health > 0) then
@@ -4220,11 +4237,26 @@ return function(Hub)
             if root then ref = root.Position end
             ref = ref or giverPos
             local b = ref and livingBoss(ref) or nil
+            if not b and quiet == 0 and os.clock() - t0 < 3 then
+                log(boss.name .. ": started but no living model with a Humanoid within " .. CFG.KillRange .. " studs in Workspace.npc right now")
+            end
             if b then
                 quiet = 0
                 local bd = b.model:FindFirstChild("bossdrop")
                 if bd and bd:IsA("StringValue") then learn(boss, bd.Value, "live npc " .. b.model.Name) end
-                Hub.placeUnder(b.part, height)
+                if lastBossName ~= b.model.Name then
+                    lastBossName = b.model.Name
+                    log(string.format("%s: fighting live npc '%s' (hp %.0f), going %d studs above it", boss.name, b.model.Name, b.hum.Health, height))
+                end
+                local rootNow = getChar()
+                local distBefore = rootNow and (rootNow.Position - b.part.Position).Magnitude
+                local moved, why = goAbove(b.part, height)
+                if os.clock() - lastDiag >= 2 then
+                    lastDiag = os.clock()
+                    log(string.format("fight: boss %.0f studs away before the move, moved=%s%s, hp %.0f, Fly=%s Kill=%s ScrollTrip=%s",
+                        distBefore or -1, tostring(moved), why and (" (" .. why .. ")") or "", b.hum.Health,
+                        tostring(State.Fly), tostring(State.Kill), tostring(State.ScrollTrip)))
+                end
                 lockCameraDown(b.part, height + 2)
                 if os.clock() - lastQ >= CFG.FightQEvery then
                     lastQ = os.clock()
@@ -4243,7 +4275,15 @@ return function(Hub)
                     task.wait(CFG.Step)
                 end
             end
-            if quiet >= CFG.QuietExit then break end
+          end)
+          if not okIter then
+              if tostring(errIter) ~= lastErr then
+                  lastErr = tostring(errIter)
+                  log("fight loop error (continuing): " .. lastErr)
+              end
+              task.wait(0.5)
+          end
+          if quiet >= CFG.QuietExit then break end
         end
         unlockCamera()
     end
