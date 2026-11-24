@@ -1,6 +1,3 @@
--- EggzyHubSolo.lua: the whole EggzyHub carried inside this one file, so it can queue itself after a server teleport
--- (same idea as your auto-relog script, whose payload is a string inside itself). Run THIS file; nothing else is needed.
-getgenv().EggzyHubSourceText = [[
 -- ============================================================================
 -- EggzyHub.lua (client-side Luau) — Full Production Build (Optimized & Cleaned)
 -- Updated: Strict boundary-detection with non-overlapping Y ranges for all regions.
@@ -87,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.172-collector",
+    BuildNote = "v1.7.173-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 172 },
+    Version = { Tweaks = 173 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -3839,6 +3836,8 @@ Config.Collector = {
     },
     SkipMaps = { "none" },       -- map buttons never visited. "none" (place 590798306) looks like a placeholder: UNVERIFIED
     TrustNameMatch = false,      -- legacy name guess, stays OFF. Ownership now comes from the companion catalog (alljutsu.companions) checked against statz.unlocked
+    ScrollCountsAsOwned = true,  -- UNVERIFIED: a drop you hold only as a "<key>scroll" entry in statz.unlocked (got it, not bought/learned yet) counts as owned. Matches seen in your list: tynV2summon / tynV2summonscroll
+    CountPickupAsGot = true,     -- when a scroll vanishes while the collector is clicking it and statz.unlocked did not change, the boss's missing drop it belongs to counts as got
     StayUntilOwned = true,       -- from you: never leave a map until every drop of its bosses is owned. false = the old behaviour (give up after NoProgressRounds / start failures)
     RetryPause = 8,              -- seconds to wait before trying again when a boss would not start or gave nothing new
     NoProgressRounds = 15,       -- rounds in a row with the same missing keys before it moves on to the next boss
@@ -3960,9 +3959,58 @@ return function(Hub)
         return statz and statz:FindFirstChild("unlocked")
     end
 
+    -- statz.unlocked as a lowercase set, refreshed every 2 seconds (it has about 3000 entries)
+    local unlockedSetCache, unlockedSetAt = nil, 0
+    local function unlockedSet()
+        if unlockedSetCache and os.clock() - unlockedSetAt < 2 then return unlockedSetCache end
+        local set, u = {}, unlockedFolder()
+        if u then
+            for _, c in ipairs(u:GetChildren()) do set[string.lower(c.Name)] = c.Name end
+        end
+        unlockedSetCache, unlockedSetAt = set, os.clock()
+        return set
+    end
+
+    local viaLogged = {}
+    -- the game's own lock check is exactly statz.unlocked:FindFirstChild(name). On top of that (ScrollCountsAsOwned) the "<key>scroll" entry counts.
     local function owned(key)
         local u = unlockedFolder()
-        return u ~= nil and u:FindFirstChild(key) ~= nil
+        if u == nil then return false end
+        if u:FindFirstChild(key) ~= nil then return true end
+        local set = unlockedSet()
+        local l = string.lower(key)
+        if set[l] then return true end
+        if CFG.ScrollCountsAsOwned then
+            local cands = { l .. "scroll" }
+            local base = string.match(l, "^(.*)boss$")
+            if base and base ~= "" then cands[#cands + 1] = base .. "scroll" end
+            for _, c in ipairs(cands) do
+                if set[c] then
+                    if not viaLogged[key] then
+                        viaLogged[key] = true
+                        log(string.format("%s: counted as got because statz.unlocked has '%s' (the scroll, not the learned item)", key, set[c]))
+                    end
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    -- unlocked entries that look related to a missing key, logged once so the real storage name shows up in your log
+    local function relatedNames(key)
+        local l = string.lower(key)
+        l = (string.gsub(l, "^bossdrop", ""))
+        l = (string.gsub(l, "boss$", ""))
+        local out = {}
+        if #l < 5 then return out end
+        for lower, name in pairs(unlockedSet()) do
+            if string.find(lower, l, 1, true) and string.lower(name) ~= string.lower(key) then
+                out[#out + 1] = name
+                if #out >= 6 then break end
+            end
+        end
+        return out
     end
 
     -- a learned key (bossdrop value or scroll model name) only counts as something to wait for when it is a real entry of a game catalog or already in your
@@ -3992,7 +4040,7 @@ return function(Hub)
     local function missingDrops(boss)
         local list = {}
         for _, key in ipairs(allKeys(boss)) do
-            if not owned(key) then list[#list + 1] = key end
+            if not owned(key) and not (boss.got and boss.got[key]) then list[#list + 1] = key end
         end
         return list
     end
@@ -4214,7 +4262,7 @@ return function(Hub)
     end
 
     -- teleport on top of the scroll, camera straight down, M1, Q every QEvery seconds
-    local function pickUp(entry)
+    local function pickUp(entry, boss)
         local t0 = os.clock()
         local lastQ, clickFallback, cdFallback = 0, false, false
         local before = {}
@@ -4250,6 +4298,24 @@ return function(Hub)
         end
         log(string.format("scroll %s: %s | new statz.unlocked entries: %s", entry.model.Name,
             entry.model.Parent and "still there when giving up" or "gone", #added > 0 and table.concat(added, ", ") or "none"))
+        -- got it but statz.unlocked did not change: count the matching missing drop as obtained
+        if boss and CFG.CountPickupAsGot and not entry.model.Parent and #added == 0 and os.clock() - t0 < CFG.ScrollGiveUp then
+            local nameL = string.lower(entry.model.Name)
+            local miss = missingDrops(boss)
+            local picked = {}
+            for _, k in ipairs(miss) do
+                local base = string.lower(k)
+                base = (string.gsub(base, "^bossdrop", ""))
+                base = (string.gsub(base, "boss$", ""))
+                if #base >= 4 and string.find(nameL, base, 1, true) then picked[#picked + 1] = k end
+            end
+            if #picked == 0 and #miss == 1 then picked[1] = miss[1] end
+            boss.got = boss.got or {}
+            for _, k in ipairs(picked) do
+                boss.got[k] = true
+                log(string.format("%s: scroll picked up and nothing new in statz.unlocked, counting '%s' as obtained", boss.name, k))
+            end
+        end
     end
 
     -- own teleport above the boss (does not depend on the hub's ScrollTrip gate); returns false plus a reason when it could not move you
@@ -4325,7 +4391,7 @@ return function(Hub)
                     quiet = 0
                     lastActivity = os.clock()
                     learn(boss, scrolls[1].model.Name, "dropped scroll model")
-                    pickUp(scrolls[1])
+                    pickUp(scrolls[1], boss)
                 else
                     unlockCamera()
                     quiet = quiet + CFG.Step
@@ -4512,6 +4578,7 @@ return function(Hub)
         end
         startWatchdog()
 
+        local relatedLogged = {}
         local bossList = buildBossList()
         log("boss list: " .. #bossList .. " entries (known table + found in Workspace)")
         do
@@ -4557,6 +4624,15 @@ return function(Hub)
                             else
                                 log(boss.name .. ": " .. CFG.NoProgressRounds .. " rounds with no new drop, moving on")
                                 break
+                            end
+                        end
+                    end
+                    for _, k in ipairs(missing) do
+                        if not relatedLogged[k] then
+                            relatedLogged[k] = true
+                            local rel = relatedNames(k)
+                            if #rel > 0 then
+                                log(string.format("%s: missing, but statz.unlocked holds related entries: %s", k, table.concat(rel, ", ")))
                             end
                         end
                     end
@@ -5472,6 +5548,3 @@ end)
 
 pcall(T3.collectorResume)
 print("[EggzyHub] Loaded successfully.")
-
-]]
-loadstring(getgenv().EggzyHubSourceText)()
