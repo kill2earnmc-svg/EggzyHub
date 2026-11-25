@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.173-collector",
+    BuildNote = "v1.7.175-collector",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 173 },
+    Version = { Tweaks = 175 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -4482,6 +4482,7 @@ return function(Hub)
             'getgenv().EggzyCollectorJob = game.JobId',
             'repeat task.wait() until game:IsLoaded() and game:GetService("Players").LocalPlayer',
             'getgenv().EggzyCollectorResume = { visited = { ' .. table.concat(idList(visitedSet), ", ") .. ' } }',
+            'getgenv().EggzyAutoBuy = ' .. tostring(State.AutoBuy == true),
             loader,
         }, "\n")
     end
@@ -4830,6 +4831,291 @@ do
     task.spawn(function()
         while lbl.Parent and Alive do
             lbl.Text = "status: " .. tostring(Config.Collector.Status)
+            task.wait(0.5)
+        end
+    end)
+end
+
+-- ===================== AUTO BUY =====================
+-- Buys everything it can: ninja tools (ReplicatedStorage.saber.powers), sub jutsu (ReplicatedStorage.alljutsu.subjutsu), companions (ReplicatedStorage.alljutsu.companions).
+-- An entry counts as bought when its name is in LocalPlayer.statz.unlocked (the game's own lock check, seen in MainScript). It never moves the player: it only fires the buy remote.
+-- The call used is startevent:FireServer("unlock", <catalog ModuleScript>). Seen in your MainScript grep: single-argument ("unlock", v136) and ("unlock", v116); v116 is compared with the
+-- companion catalog entries in the game's own menu code, so it is the selected catalog item. UNVERIFIED: that this call buys a ninja tool / sub jutsu / companion on the server (the Kekkei Genkai
+-- ("unlock", x, Kg) forms and the ("buyrework"...) / ("buyabilityrework"...) re-work forms are NOT used). The server decides cost and requirements; every item is checked in statz.unlocked after the call,
+-- and the status line reports bought vs refused per category. Companions may be drop-only, the status will show it.
+-- A category call looks like: call = { remote = "startevent", args = function(item) return { "unlock", item } end }   (item = the catalog ModuleScript)
+-- When the Boss Collector hops to another map and this is ON, the reloaded hub switches it on again (see reloadCode in the collector).
+Config.AutoBuy = {
+    Interval = 5,            -- seconds between passes while ON (uncalibrated)
+    Pause = 0.5,             -- seconds between two buy calls (uncalibrated)
+    VerifyWait = 0.7,        -- seconds to wait before checking statz.unlocked after a buy call
+    MaxAttempts = 1,         -- an item the server does not unlock after this many tries is left alone for RetryAfter seconds
+    RetryAfter = 300,
+    MaxPerPass = 60,
+    Status = "idle",
+    Categories = {
+        { key = "ninjaTools", label = "Ninja tools", path = { "saber", "powers" }, enabled = true, call = nil },
+        { key = "subJutsu",   label = "Sub jutsu",   path = { "alljutsu", "subjutsu" }, enabled = true, call = nil },
+        { key = "companions", label = "Companions",  path = { "alljutsu", "companions" }, enabled = true, call = nil },
+    },
+}
+Config.AutoBuy.UnlockCall = { remote = "startevent", args = function(item) return { "unlock", item } end }
+for _, cat in ipairs(Config.AutoBuy.Categories) do cat.call = Config.AutoBuy.UnlockCall end
+State.AutoBuy = false
+
+T3.autoBuySource = [===[
+-- Auto Buy module, compiled by the hub inside a pcall so a mistake here can never stop the hub from loading.
+return function(Hub)
+    local A = { running = false }
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local LocalPlayer, Config, State = Hub.LocalPlayer, Hub.Config, Hub.State
+    local CFG = Config.AutoBuy
+    local tries = {}   -- item name -> { n = attempts, last = os.clock() }
+
+    local function say(msg)
+        CFG.Status = msg
+        print("[EggzyAutoBuy] " .. msg)
+    end
+
+    local function on() return A.running and State.AutoBuy and Hub.isAlive() end
+
+    local function unlockedFolder()
+        local statz = LocalPlayer:FindFirstChild("statz")
+        return statz and statz:FindFirstChild("unlocked")
+    end
+
+    local function catalogFolder(cat)
+        local node = ReplicatedStorage
+        for _, n in ipairs(cat.path) do node = node and node:FindFirstChild(n) end
+        return node
+    end
+
+    local function candidates(cat)
+        local list, folder, u = {}, catalogFolder(cat), unlockedFolder()
+        if not (folder and u) then return list end
+        for _, c in ipairs(folder:GetChildren()) do
+            if c:IsA("ModuleScript") and not u:FindFirstChild(c.Name) then
+                local t = tries[c.Name]
+                if not (t and t.n >= CFG.MaxAttempts and os.clock() - t.last < CFG.RetryAfter) then
+                    list[#list + 1] = c
+                end
+            end
+        end
+        -- the ones you already hold as "<key>scroll" go first
+        table.sort(list, function(a, b)
+            local sa = u:FindFirstChild(a.Name .. "scroll") ~= nil
+            local sb = u:FindFirstChild(b.Name .. "scroll") ~= nil
+            if sa ~= sb then return sa end
+            return a.Name < b.Name
+        end)
+        return list
+    end
+
+    local function fire(cat, item)
+        local call = cat.call
+        local remote = LocalPlayer:FindFirstChild(call.remote or "startevent")
+        if not (remote and remote:IsA("BaseRemoteEvent")) then return false end
+        local okA, args = pcall(call.args, item)
+        if not (okA and type(args) == "table") then return false end
+        return pcall(function() remote:FireServer(table.unpack(args)) end)
+    end
+
+    -- one pass over every enabled category that has a call; returns how many items were unlocked, how many were refused, how many categories were skipped
+    function A.Pass()
+        local bought, refused, gated = 0, 0, 0
+        local fired = 0
+        local detail = {}
+        for _, cat in ipairs(CFG.Categories) do
+            if cat.enabled and not cat.call then gated = gated + 1 end
+            if cat.enabled and cat.call then
+                local cb, cr = 0, 0
+                for _, item in ipairs(candidates(cat)) do
+                    if fired >= CFG.MaxPerPass or not Hub.isAlive() then break end
+                    fired = fired + 1
+                    if fire(cat, item) then
+                        task.wait(CFG.VerifyWait)
+                        local u = unlockedFolder()
+                        local t = tries[item.Name] or { n = 0, last = 0 }
+                        tries[item.Name] = t
+                        t.last = os.clock()
+                        if u and u:FindFirstChild(item.Name) then
+                            bought = bought + 1
+                            cb = cb + 1
+                            tries[item.Name] = nil
+                            print("[EggzyAutoBuy] bought " .. cat.label .. ": " .. item.Name)
+                        else
+                            t.n = t.n + 1
+                            refused = refused + 1
+                            cr = cr + 1
+                        end
+                    end
+                    task.wait(CFG.Pause)
+                end
+                detail[#detail + 1] = string.format("%s %d bought / %d refused", cat.label, cb, cr)
+            end
+        end
+        return bought, refused, gated, table.concat(detail, " | ")
+    end
+
+    function A.Run()
+        A.running = true
+        State.AutoBuy = true
+        say("running")
+        while on() do
+            local any = false
+            for _, cat in ipairs(CFG.Categories) do
+                if cat.enabled and cat.call then any = true end
+            end
+            if not any then
+                say("needs config: no buy call is set for any enabled category (run WrenchBuyScan.lua and paste it)")
+            else
+                local bought, refused, gated, detail = A.Pass()
+                say(string.format("pass done: %d bought, %d refused by the server (%s)", bought, refused, detail))
+            end
+            local t0 = os.clock()
+            while on() and os.clock() - t0 < CFG.Interval do task.wait(0.25) end
+        end
+        A.running = false
+    end
+
+    function A.Stop()
+        A.running = false
+        State.AutoBuy = false
+        say("stopped")
+    end
+
+    return A
+end
+]===]
+
+function T3.autoBuyHub()
+    return { Config = Config, State = State, LocalPlayer = LocalPlayer, isAlive = function() return Alive end }
+end
+
+function T3.startAutoBuy()
+    if T3.autoBuyMod and T3.autoBuyMod.running then return end
+    State.AutoBuy = true
+    Config.AutoBuy.Status = "starting..."
+    local fn, err = loadstring(T3.autoBuySource)
+    if not fn then
+        Config.AutoBuy.Status = "could not compile: " .. tostring(err)
+        print("[EggzyAutoBuy] could not compile: " .. tostring(err))
+        State.AutoBuy = false
+        return
+    end
+    local okB, builder = pcall(fn)
+    local okM, mod
+    if okB and type(builder) == "function" then okM, mod = pcall(builder, T3.autoBuyHub()) end
+    if not (okM and type(mod) == "table") then
+        Config.AutoBuy.Status = "could not start the module: " .. tostring(okB and mod or builder)
+        print("[EggzyAutoBuy] could not start the module: " .. tostring(okB and mod or builder))
+        State.AutoBuy = false
+        return
+    end
+    T3.autoBuyMod = mod
+    task.spawn(function()
+        local okR, errR = pcall(mod.Run)
+        if not okR then
+            Config.AutoBuy.Status = "stopped by an error: " .. tostring(errR)
+            print("[EggzyAutoBuy] stopped by an error: " .. tostring(errR))
+            pcall(mod.Stop)
+        end
+    end)
+end
+
+function T3.stopAutoBuy()
+    if T3.autoBuyMod then pcall(T3.autoBuyMod.Stop) end
+    State.AutoBuy = false
+end
+
+-- "Buy now" button: one pass, whether or not the toggle is on
+function T3.buyNow()
+    if T3.buyNowBusy then return end
+    T3.buyNowBusy = true
+    task.spawn(function()
+        local fn = loadstring(T3.autoBuySource)
+        local okB, builder = pcall(fn or function() end)
+        local okM, mod
+        if okB and type(builder) == "function" then okM, mod = pcall(builder, T3.autoBuyHub()) end
+        if okM and type(mod) == "table" then
+            local anySet = false
+            for _, cat in ipairs(Config.AutoBuy.Categories) do
+                if cat.enabled and cat.call then anySet = true end
+            end
+            if not anySet then
+                Config.AutoBuy.Status = "needs config: no buy call is set for any enabled category (run WrenchBuyScan.lua and paste it)"
+            else
+                Config.AutoBuy.Status = "buying..."
+                local okP, bought, refused, _, detail = pcall(mod.Pass)
+                Config.AutoBuy.Status = okP and string.format("buy now done: %d bought, %d refused by the server (%s)", bought or 0, refused or 0, tostring(detail or ""))
+                    or ("buy now error: " .. tostring(bought))
+            end
+        else
+            Config.AutoBuy.Status = "could not start the module"
+        end
+        T3.buyNowBusy = false
+    end)
+end
+
+-- the queued payload of a collector hop sets getgenv().EggzyAutoBuy = true when Auto Buy was ON; the reloaded hub switches it on again
+function T3.autoBuyResume()
+    local okE, genv = pcall(getgenv)
+    if okE and genv and genv.EggzyAutoBuy == true then
+        genv.EggzyAutoBuy = nil
+        print("[EggzyAutoBuy] switching Auto Buy back on after the hop")
+        T3.startAutoBuy()
+    end
+end
+
+do
+    local card, body = createCard(autoPage, "Auto Buy", 7)
+    local function noCallSet()
+        for _, cat in ipairs(Config.AutoBuy.Categories) do
+            if cat.enabled and cat.call then return false end
+        end
+        return true
+    end
+    createToggle(body, "Auto Buy", 1, function() return State.AutoBuy == true end, function(v)
+        if v then T3.startAutoBuy() else T3.stopAutoBuy() end
+    end, noCallSet)
+
+    local btn = Instance.new("TextButton")
+    btn.Name = "Buy everything now"
+    btn.Size = UDim2.new(1, 0, 0, 36)
+    btn.BackgroundColor3 = Theme.Off
+    btn.BorderSizePixel = 0
+    btn.Text = "Buy everything now"
+    btn.TextColor3 = Theme.Text
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 12
+    btn.AutoButtonColor = true
+    btn.LayoutOrder = 2
+    btn.Parent = body
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
+    btn.MouseButton1Click:Connect(T3.buyNow)
+
+    for i, cat in ipairs(Config.AutoBuy.Categories) do
+        createToggle(body, cat.label, 2 + i, function() return cat.enabled end, function(v)
+            cat.enabled = v
+        end, function() return cat.call == nil end)
+    end
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Name = "AutoBuyStatus"
+    lbl.Size = UDim2.new(1, 0, 0, 48)
+    lbl.BackgroundTransparency = 1
+    lbl.TextWrapped = true
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextYAlignment = Enum.TextYAlignment.Top
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 11
+    lbl.TextColor3 = Theme.TextDim
+    lbl.LayoutOrder = 10
+    lbl.Text = "status: idle"
+    lbl.Parent = body
+    task.spawn(function()
+        while lbl.Parent and Alive do
+            lbl.Text = "status: " .. tostring(Config.AutoBuy.Status)
             task.wait(0.5)
         end
     end)
@@ -5522,6 +5808,7 @@ closeBtn.MouseButton1Click:Connect(function()
     Alive = false
     State.Mentor = false
     pcall(T3.stopCollector)
+    pcall(T3.stopAutoBuy)
     pcall(function() RunService:UnbindFromRenderStep("EggzyFullbright") end)
     pcall(T3.fbRestore)
     pcall(stopFaceLock)
@@ -5547,4 +5834,5 @@ closeBtn.MouseButton1Click:Connect(function()
 end)
 
 pcall(T3.collectorResume)
+pcall(T3.autoBuyResume)
 print("[EggzyHub] Loaded successfully.")
