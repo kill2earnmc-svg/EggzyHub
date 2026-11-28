@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.183-questcheck-log",
+    BuildNote = "v1.7.184-questcheck-wait",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 183 },
+    Version = { Tweaks = 184 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -197,7 +197,9 @@ local Config = {
         },
         QuestCheck = {                   -- after talking for the NEXT quest (2, 3, 4): did the game really hand it over? if not, redo the previous quest's input and talk again
             Enabled = true,
-            Redo    = false,             -- v1.7.182 read "not taken" when the quest WAS taken (RPGQuest texts + direct statz values do not change on a hand-over), so redoing is off until the real signal is found; the check only logs
+            Redo    = true,              -- v1.7.182 judged at 12 s, but the game hands the quest over about 30 s after the talk (from you), so it read "not taken" too early; now it waits for the change
+            Wait    = 60,                -- seconds after the talk to keep waiting for the quest to change before it counts as not taken (uncalibrated: you saw about 30 s)
+            Settle  = 2,                 -- seconds between "quest taken" and the first input (uncalibrated)
             File    = "EggzyQuestCheck.txt", -- every check writes what changed on screen and in your data between the talk and now; send this file to find the real signal
             Retries = 2,                 -- from you: redo the previous quest's input twice (each redo is followed by a new talk and a new check, so it stops as soon as the quest is taken)
             Gui     = "RPGQuest",        -- ASSUMED, unverified: the quest screen under PlayerGui whose texts change when a quest is handed over (found by script grep: it holds the treejump scripts). If it is missing the check reports "unknown" and never redoes anything
@@ -2864,9 +2866,17 @@ task.spawn(function()
             pcall(function()
                 local pc = T3.pendingCheck
                 if pc and (phase == "m1" or phase == "t2" or phase == "t3") and pc.mission == m.Mission then
-                    T3.pendingCheck = nil
                     local n = pc.mission
                     local verdict, why = T3.questTaken(pc.before, pc.why)
+                    local waited = os.clock() - pc.talkAt
+                    if verdict == "not" and waited < m.QuestCheck.Wait then
+                        -- the hand-over comes late (about 30 s), so keep looking instead of judging at 12 s; no input is sent until the quest changed
+                        MentorInfo.phase = string.format("waiting for quest %d to be taken (%d s)", n, waited)
+                        nextAt = os.clock() + 1
+                        return
+                    end
+                    T3.pendingCheck = nil
+                    why = string.format("%s; %.0f s after the talk", why, waited)
                     T3.redos = T3.redos or {}
                     local used = T3.redos[n] or 0
                     print(string.format("[EggzyMentor] quest %d check: %s (%s)", n, verdict, why))
@@ -2874,8 +2884,13 @@ task.spawn(function()
                         local onlyB, onlyA = T3.wideDiff(pc.wide, T3.wideSnapshot())
                         T3.logQuestCheck(n, verdict, why, onlyB, onlyA)
                     end
+                    if verdict == "taken" then
+                        nextAt = os.clock() + m.QuestCheck.Settle
+                        T3.redos[n] = 0
+                        return
+                    end
                     if verdict == "not" and not m.QuestCheck.Redo then
-                        print("[EggzyMentor] redo is off (QuestCheck.Redo = false): the check is only logging until the real quest signal is known")
+                        print("[EggzyMentor] redo is off (QuestCheck.Redo = false): continuing with the training")
                     elseif verdict == "not" and used < m.QuestCheck.Retries then
                         T3.redos[n] = used + 1
                         local prev = n - 1
@@ -2939,7 +2954,7 @@ task.spawn(function()
                         end
                         local ok = pcall(function() remote:FireServer(LocalPlayer) end)
                         if ok then
-                            T3.pendingCheck = wantCheck and { mission = m.Mission, before = fpBefore, why = fpWhy, wide = wideBefore } or nil
+                            T3.pendingCheck = wantCheck and { mission = m.Mission, before = fpBefore, why = fpWhy, wide = wideBefore, talkAt = os.clock() } or nil
                             local tagMission = m.Mission
                             task.delay(2, function() pcall(T3.questSnapshot, "2 s after talking, hub training " .. tagMission) end)
                             phase, presses = (m.Mission == 2 and "t2") or ((m.Mission == 3 or m.Mission == 4) and "t3") or (m.Mission == 5 and "t5wait") or "m1", 0
