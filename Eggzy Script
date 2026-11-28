@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.175-collector",
+    BuildNote = "v1.7.182-questcheck",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 175 },
+    Version = { Tweaks = 182 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -194,6 +194,12 @@ local Config = {
             RoundGap      = 0.3,
             MaxFails      = 3,          -- consecutive failed rounds before talking to the mentor again
             Poll          = 0.1,
+        },
+        QuestCheck = {                   -- after talking for the NEXT quest (2, 3, 4): did the game really hand it over? if not, redo the previous quest's input and talk again
+            Enabled = true,
+            Retries = 2,                 -- from you: redo the previous quest's input twice (each redo is followed by a new talk and a new check, so it stops as soon as the quest is taken)
+            Gui     = "RPGQuest",        -- ASSUMED, unverified: the quest screen under PlayerGui whose texts change when a quest is handed over (found by script grep: it holds the treejump scripts). If it is missing the check reports "unknown" and never redoes anything
+            MaxLines = 400,              -- texts read from that screen per check
         },
         QuestSnapshotFile = "EggzyQuestSnapshot.txt", -- written after every talk and in the fight server; shows what the game exposes about the current quest
         Training5 = {                    -- quest 5: mentor fight in the other server
@@ -336,7 +342,7 @@ local State = {
     Fly = false, Noclip = false, AutoQuest = false, Kill = false,
     Scrolls = false, TpScroll = false, Grind = false, Fps = false,
     Speed = false, Jump = false, InfiniteJump = false, Mentor = false, Collector = false,
-    Returning = false, AutoRank = false,
+    Returning = false, AutoRank = false, BlockBug = false, 
     ScrollTrip = false, -- true while the scroll stealer is away from the grind position
     BossAlive = nil,
     ESP = { ScrollESP = false, Players = false, BossNPCESP = false } 
@@ -679,7 +685,34 @@ local function sendMouse(down)
     end
 end
 
+-- Mouse buttons for the Block Bug trigger: 1 = left (hit), 2 = right (block). Centre-of-viewport like sendMouse, so a click never lands on the hub.
+local bbHeld = { [1] = false, [2] = false }
+local function bbMouse(button, down)
+    local cam = Workspace.CurrentCamera
+    if okVim and VIM then
+        local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+        VIM:SendMouseButtonEvent(vp.X / 2, vp.Y / 2, button - 1, down, game, 0)
+    else
+        local at = cam and cam.CFrame or CFrame.new()
+        if button == 1 then
+            if down then VirtualUser:Button1Down(Vector2.zero, at) else VirtualUser:Button1Up(Vector2.zero, at) end
+        else
+            if down then VirtualUser:Button2Down(Vector2.zero, at) else VirtualUser:Button2Up(Vector2.zero, at) end
+        end
+    end
+    bbHeld[button] = down
+end
+local function bbReleaseAll()
+    for button = 1, 2 do
+        if bbHeld[button] then
+            bbHeld[button] = false
+            pcall(bbMouse, button, false)
+        end
+    end
+end
+
 local function forceReleaseInputs()
+    bbReleaseAll()
     for keyCode in pairs(heldKeys) do
         heldKeys[keyCode] = nil
         pcall(sendKey, false, keyCode)
@@ -1477,6 +1510,7 @@ end)
 
 -- ===================== INPUT PANIC =====================
 local function panic()
+    State.BlockBug = false
     forceReleaseInputs()
     pcall(function()
         local tb = UserInputService:GetFocusedTextBox()
@@ -2448,6 +2482,51 @@ function T3.questSnapshot(tag)
     if Config.Debug then print("[EggzyMentor] quest snapshot saved: " .. tostring(tag)) end
 end
 
+-- Quest-taken check (UNVERIFIED): the game's own "current quest" value is not known, so this compares a fingerprint of the quest screen texts
+-- (Config.Mentor.QuestCheck.Gui) and the direct values under LocalPlayer.statz taken right before and ~12 s after talking to the mentor.
+-- Same fingerprint = the talk changed nothing = the next quest was not handed over. Missing screen = "unknown" (never triggers a redo).
+function T3.questFingerprint()
+    local qc = Config.Mentor.QuestCheck
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local gui = pg and pg:FindFirstChild(qc.Gui)
+    if not gui then return nil, "PlayerGui." .. tostring(qc.Gui) .. " not found" end
+    local lines, n = {}, 0
+    if gui:IsA("ScreenGui") then lines[#lines + 1] = "gui.Enabled=" .. tostring(gui.Enabled) end
+    for _, d in ipairs(gui:GetDescendants()) do
+        if n >= qc.MaxLines then break end
+        if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+            n += 1
+            lines[#lines + 1] = "gui " .. d:GetFullName():gsub("^.-" .. qc.Gui .. "%.", "") .. " vis=" .. tostring(d.Visible) .. " = " .. d.Text:sub(1, 120)
+        end
+    end
+    local statz = LocalPlayer:FindFirstChild("statz")
+    if statz then
+        for _, v in ipairs(statz:GetChildren()) do
+            if v:IsA("ValueBase") then lines[#lines + 1] = "statz." .. v.Name .. " = " .. tostring(v.Value) end
+        end
+    end
+    table.sort(lines)
+    return table.concat(lines, "\n"), nil
+end
+
+-- returns "taken", "not" or "unknown", plus a short reason for the console
+function T3.questTaken(before, beforeWhy)
+    local after, afterWhy = T3.questFingerprint()
+    if before == nil or after == nil then
+        return "unknown", beforeWhy or afterWhy or "no fingerprint"
+    end
+    if before == after then
+        return "not", "quest screen and statz are identical before and after talking"
+    end
+    local was = {}
+    for line in before:gmatch("[^\n]+") do was[line] = true end
+    local diff = {}
+    for line in after:gmatch("[^\n]+") do
+        if not was[line] and #diff < 3 then diff[#diff + 1] = line:sub(1, 100) end
+    end
+    return "taken", "changed: " .. (#diff > 0 and table.concat(diff, " | ") or "a line disappeared")
+end
+
 -- Progress: which training the chain is on, kept in ProgressFile so leaving and rejoining continues where you were.
 -- A training that was interrupted restarts from its beginning (the count inside it is not saved).
 function T3.loadProgress()
@@ -2702,6 +2781,28 @@ task.spawn(function()
             MentorInfo.phase = "paused (grind)"
         elseif os.clock() >= nextAt then
             pcall(function()
+                local pc = T3.pendingCheck
+                if pc and (phase == "m1" or phase == "t2" or phase == "t3") and pc.mission == m.Mission then
+                    T3.pendingCheck = nil
+                    local n = pc.mission
+                    local verdict, why = T3.questTaken(pc.before, pc.why)
+                    T3.redos = T3.redos or {}
+                    local used = T3.redos[n] or 0
+                    print(string.format("[EggzyMentor] quest %d check: %s (%s)", n, verdict, why))
+                    if verdict == "not" and used < m.QuestCheck.Retries then
+                        T3.redos[n] = used + 1
+                        local prev = n - 1
+                        m.Mission = prev
+                        phase, presses, t2Fails = (prev == 2 and "t2") or (prev == 3 and "t3") or "m1", 0, 0
+                        MentorInfo.phase = string.format("quest %d not taken: redoing training %d (%d/%d)", n, prev, used + 1, m.QuestCheck.Retries)
+                        print("[EggzyMentor] " .. MentorInfo.phase)
+                        nextAt = os.clock() + 0.5
+                        return
+                    elseif verdict == "not" then
+                        print(string.format("[EggzyMentor] quest %d still not taken after %d redos: continuing with training %d anyway", n, used, n))
+                    end
+                    T3.redos[n] = 0
+                end
                 if m.Mission >= 6 then
                     local okN, nm = pcall(detectMentorName)
                     if okN and nm and T3.progressName and T3.progressName ~= "" and nm ~= T3.progressName then
@@ -2741,8 +2842,13 @@ task.spawn(function()
                     end
                     if remote then
                         stopFaceLock()
+                        -- only the talk that follows a finished training is "the next quest" (a talk that retries a failed training must not be checked)
+                        local wantCheck = m.QuestCheck.Enabled and m.Mission >= 2 and m.Mission <= 4 and m.Mission == (T3.completed or 0) + 1
+                        local fpBefore, fpWhy
+                        if wantCheck then fpBefore, fpWhy = T3.questFingerprint() end
                         local ok = pcall(function() remote:FireServer(LocalPlayer) end)
                         if ok then
+                            T3.pendingCheck = wantCheck and { mission = m.Mission, before = fpBefore, why = fpWhy } or nil
                             local tagMission = m.Mission
                             task.delay(2, function() pcall(T3.questSnapshot, "2 s after talking, hub training " .. tagMission) end)
                             phase, presses = (m.Mission == 2 and "t2") or ((m.Mission == 3 or m.Mission == 4) and "t3") or (m.Mission == 5 and "t5wait") or "m1", 0
@@ -2781,6 +2887,7 @@ task.spawn(function()
                     end
                     if presses >= t.Repeats then
                         MentorInfo.phase = "t2 done"
+                        T3.completed = 2
                         m.Mission = 3
                         phase, presses, t2Fails = "talk", 0, 0
                         nextAt = os.clock() + m.Interval
@@ -2807,6 +2914,7 @@ task.spawn(function()
                     MentorInfo.phase = string.format("%s targets %d/%d", lookOnly and "t4" or "t3", presses, t.Repeats)
                     if presses >= t.Repeats then
                         MentorInfo.phase = lookOnly and "t4 done" or "t3 done"
+                        T3.completed = lookOnly and 4 or 3
                         m.Mission = lookOnly and 5 or 4
                         phase, presses, t2Fails = "talk", 0, 0
                         nextAt = os.clock() + m.Interval
@@ -2830,6 +2938,7 @@ task.spawn(function()
                     end
                     MentorInfo.phase = string.format("M1 %d/%d", presses, m.M1Count)
                     if presses >= m.M1Count then
+                        T3.completed = 1
                         m.Mission = 2
                         phase, presses = "talk", 0
                         nextAt = os.clock() + m.Interval
@@ -5121,6 +5230,132 @@ do
     end)
 end
 
+-- ===================== BLOCK BUG TRIGGER (UNVERIFIED) =====================
+-- WrenchInvincWatch found nothing on the client that marks the invincibility bug (no extra value, ForceField or part change), so this cannot create it.
+-- It repeats the manual trick: once Character.combat.damagecounter is at the threshold, hold block (right mouse) and hit (left mouse).
+-- Not run in game yet. Whether the right mouse button sent through VirtualInputManager counts as block is untested.
+Config.BlockBug = {
+    Threshold = 200000,   -- from the description "take 200k damage"; the capture only shows a combo that ended at damagecounter 256455
+    AttemptSeconds = 3,   -- block is held this long per attempt, left mouse is tapped during it (untuned)
+    TapEvery = 0.35,      -- untuned
+    TapHold = 0.05,       -- untuned
+    RetryGap = 1,         -- untuned
+    Status = "off",
+}
+T3.bbRun = 0 -- generation counter: a loop from an older start ends itself
+
+function T3.bbCounter()
+    local char = LocalPlayer.Character
+    local combat = char and char:FindFirstChild("combat")
+    local v = combat and combat:FindFirstChild("damagecounter")
+    if v and v:IsA("ValueBase") then
+        local n = v.Value
+        if type(n) == "number" and n == n and n >= 0 and n < 1e9 then
+            return n
+        end
+    end
+    return nil
+end
+
+function T3.bbCanSend()
+    if not (Alive and State.BlockBug and windowFocused) then return false end
+    if UserInputService:GetFocusedTextBox() then return false end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return hum ~= nil and hum.Health > 0
+end
+
+function T3.stopBlockBug()
+    State.BlockBug = false
+    T3.bbRun += 1
+    bbReleaseAll()
+    Config.BlockBug.Status = "off"
+end
+
+function T3.startBlockBug()
+    if State.BlockBug then return end
+    State.BlockBug = true
+    T3.bbRun += 1
+    local gen = T3.bbRun
+    local C = Config.BlockBug
+    local function live() return Alive and State.BlockBug and T3.bbRun == gen end
+    task.spawn(function()
+        local attempts = 0
+        while live() do
+            local n = T3.bbCounter()
+            if n == nil then
+                C.Status = "waiting: no combat.damagecounter on the character"
+                task.wait(0.5)
+            elseif n < C.Threshold then
+                C.Status = string.format("armed: damage %d / %d", n, C.Threshold)
+                task.wait(0.2)
+            elseif not T3.bbCanSend() then
+                C.Status = "paused: window not focused, typing, or dead"
+                task.wait(0.3)
+            else
+                attempts += 1
+                C.Status = string.format("attempt %d: damage %d, holding block", attempts, n)
+                local endAt = os.clock() + C.AttemptSeconds
+                local nextTap = 0
+                pcall(bbMouse, 2, true)
+                while live() and os.clock() < endAt and T3.bbCanSend() and (T3.bbCounter() or 0) >= C.Threshold do
+                    if os.clock() >= nextTap then
+                        pcall(bbMouse, 1, true)
+                        task.wait(C.TapHold)
+                        pcall(bbMouse, 1, false)
+                        nextTap = os.clock() + C.TapEvery
+                    end
+                    task.wait(0.05)
+                end
+                bbReleaseAll()
+                task.wait(C.RetryGap)
+            end
+        end
+        bbReleaseAll()
+    end)
+end
+
+do
+    local card, body = createCard(autoPage, "Block Bug (unverified)", 8)
+    createToggle(body, "Block Bug trigger", 1, function() return State.BlockBug == true end, function(v)
+        if v then T3.startBlockBug() else T3.stopBlockBug() end
+    end)
+
+    local note = Instance.new("TextLabel")
+    note.Name = "BlockBugNote"
+    note.Size = UDim2.new(1, 0, 0, 40)
+    note.BackgroundTransparency = 1
+    note.TextWrapped = true
+    note.TextXAlignment = Enum.TextXAlignment.Left
+    note.TextYAlignment = Enum.TextYAlignment.Top
+    note.Font = Enum.Font.Gotham
+    note.TextSize = 11
+    note.TextColor3 = Theme.TextMuted
+    note.LayoutOrder = 2
+    note.Text = "Holds block and taps hit once your damage counter reaches the threshold. It repeats the manual trick; it does not create the bug."
+    note.Parent = body
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Name = "BlockBugStatus"
+    lbl.Size = UDim2.new(1, 0, 0, 32)
+    lbl.BackgroundTransparency = 1
+    lbl.TextWrapped = true
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextYAlignment = Enum.TextYAlignment.Top
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 11
+    lbl.TextColor3 = Theme.TextDim
+    lbl.LayoutOrder = 3
+    lbl.Text = "status: off"
+    lbl.Parent = body
+    task.spawn(function()
+        while lbl.Parent and Alive do
+            lbl.Text = "status: " .. tostring(Config.BlockBug.Status)
+            task.wait(0.5)
+        end
+    end)
+end
+
 do
     local card, body = createCard(autoPage, "Quest & Farm", 1)
     createToggle(body, "Money Grind", 3, function() return State.Grind end, function(v)
@@ -5809,6 +6044,7 @@ closeBtn.MouseButton1Click:Connect(function()
     State.Mentor = false
     pcall(T3.stopCollector)
     pcall(T3.stopAutoBuy)
+    pcall(T3.stopBlockBug)
     pcall(function() RunService:UnbindFromRenderStep("EggzyFullbright") end)
     pcall(T3.fbRestore)
     pcall(stopFaceLock)
