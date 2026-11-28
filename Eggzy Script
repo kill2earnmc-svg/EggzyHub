@@ -84,10 +84,10 @@ local function isScrollModel(m)
 end
 
 local Config = {
-    BuildNote = "v1.7.182-questcheck",
+    BuildNote = "v1.7.183-questcheck-log",
     -- Shown on the Home page: every 10 tweaks = 1 on the left of the dot, the remainder on the right (33 tweaks -> 3.3).
     -- Counting starts from the last build number so far (113 -> 11.3); add 1 to Tweaks for each tweak made to the hub.
-    Version = { Tweaks = 182 },
+    Version = { Tweaks = 183 },
     Debug = true,
     MapDebug = false,  -- map/region detection prints ([EggzyMap]); off so they do not spam the console
     PanicKey = Enum.KeyCode.End,
@@ -197,6 +197,8 @@ local Config = {
         },
         QuestCheck = {                   -- after talking for the NEXT quest (2, 3, 4): did the game really hand it over? if not, redo the previous quest's input and talk again
             Enabled = true,
+            Redo    = false,             -- v1.7.182 read "not taken" when the quest WAS taken (RPGQuest texts + direct statz values do not change on a hand-over), so redoing is off until the real signal is found; the check only logs
+            File    = "EggzyQuestCheck.txt", -- every check writes what changed on screen and in your data between the talk and now; send this file to find the real signal
             Retries = 2,                 -- from you: redo the previous quest's input twice (each redo is followed by a new talk and a new check, so it stops as soon as the quest is taken)
             Gui     = "RPGQuest",        -- ASSUMED, unverified: the quest screen under PlayerGui whose texts change when a quest is handed over (found by script grep: it holds the treejump scripts). If it is missing the check reports "unknown" and never redoes anything
             MaxLines = 400,              -- texts read from that screen per check
@@ -2527,6 +2529,85 @@ function T3.questTaken(before, beforeWhy)
     return "taken", "changed: " .. (#diff > 0 and table.concat(diff, " | ") or "a line disappeared")
 end
 
+-- Wide before/after view used only to LOG what a quest hand-over changes (visible texts, player attributes, statz values). Not used for the verdict.
+T3.wideNoise = { "changestring", "movevector", "mousetarget", "cooldown" }
+function T3.wideSnapshot()
+    local set, n = {}, 0
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if pg then
+        for _, d in ipairs(pg:GetDescendants()) do
+            if n >= 900 then break end
+            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Visible and d.Text ~= "" then
+                n += 1
+                local rel = d:GetFullName():gsub("^.-PlayerGui%.", "")
+                set["gui " .. rel .. " = " .. d.Text:sub(1, 100)] = true
+            end
+        end
+    end
+    for k, v in pairs(LocalPlayer:GetAttributes()) do
+        set["attr " .. tostring(k) .. " = " .. tostring(v)] = true
+    end
+    local statz = LocalPlayer:FindFirstChild("statz")
+    if statz then
+        local c = 0
+        for _, v in ipairs(statz:GetDescendants()) do
+            if c >= 600 then break end
+            if v:IsA("ValueBase") then
+                c += 1
+                local rel = v:GetFullName():gsub("^.-statz%.", "")
+                set["statz." .. rel .. " = " .. tostring(v.Value)] = true
+            end
+        end
+    end
+    for _, v in ipairs(LocalPlayer:GetChildren()) do
+        if v:IsA("ValueBase") then set["player." .. v.Name .. " = " .. tostring(v.Value)] = true end
+    end
+    return set
+end
+
+function T3.wideDiff(before, after)
+    local function noisy(line)
+        local l = line:lower()
+        for _, w in ipairs(T3.wideNoise) do
+            if l:find(w, 1, true) then return true end
+        end
+        return false
+    end
+    local KEYS = { "quest", "mission", "training", "amount", "sensei", "mentor", "kunai", "tree", "jump", "m1", "punch" }
+    local function rank(line)
+        local l = line:lower()
+        for i, w in ipairs(KEYS) do
+            if l:find(w, 1, true) then return i end
+        end
+        return #KEYS + 1
+    end
+    local onlyB, onlyA = {}, {}
+    for line in pairs(before) do if not after[line] and not noisy(line) then onlyB[#onlyB + 1] = line end end
+    for line in pairs(after) do if not before[line] and not noisy(line) then onlyA[#onlyA + 1] = line end end
+    local function order(a, b)
+        local ra, rb = rank(a), rank(b)
+        if ra ~= rb then return ra < rb end
+        return a < b
+    end
+    table.sort(onlyB, order)
+    table.sort(onlyA, order)
+    return onlyB, onlyA
+end
+
+T3.checkLog = {}
+function T3.logQuestCheck(n, verdict, why, onlyB, onlyA)
+    local out = { string.format("== quest %d check %s: %s (%s)", n, os.date("%X"), verdict, why) }
+    out[#out + 1] = "-- gone since the talk:"
+    for i, l in ipairs(onlyB) do if i <= 60 then out[#out + 1] = "  " .. l end end
+    out[#out + 1] = "-- new since the talk:"
+    for i, l in ipairs(onlyA) do if i <= 60 then out[#out + 1] = "  " .. l end end
+    T3.checkLog[#T3.checkLog + 1] = table.concat(out, "\n")
+    if writefile then pcall(writefile, Config.Mentor.QuestCheck.File, table.concat(T3.checkLog, "\n\n")) end
+    print(string.format("[EggzyMentor] quest %d check: %d lines gone, %d new since the talk (top ones below, all in %s)", n, #onlyB, #onlyA, Config.Mentor.QuestCheck.File))
+    for i = 1, math.min(6, #onlyB) do print("[EggzyMentor]   gone: " .. onlyB[i]) end
+    for i = 1, math.min(6, #onlyA) do print("[EggzyMentor]   new:  " .. onlyA[i]) end
+end
+
 -- Progress: which training the chain is on, kept in ProgressFile so leaving and rejoining continues where you were.
 -- A training that was interrupted restarts from its beginning (the count inside it is not saved).
 function T3.loadProgress()
@@ -2789,7 +2870,13 @@ task.spawn(function()
                     T3.redos = T3.redos or {}
                     local used = T3.redos[n] or 0
                     print(string.format("[EggzyMentor] quest %d check: %s (%s)", n, verdict, why))
-                    if verdict == "not" and used < m.QuestCheck.Retries then
+                    if pc.wide then
+                        local onlyB, onlyA = T3.wideDiff(pc.wide, T3.wideSnapshot())
+                        T3.logQuestCheck(n, verdict, why, onlyB, onlyA)
+                    end
+                    if verdict == "not" and not m.QuestCheck.Redo then
+                        print("[EggzyMentor] redo is off (QuestCheck.Redo = false): the check is only logging until the real quest signal is known")
+                    elseif verdict == "not" and used < m.QuestCheck.Retries then
                         T3.redos[n] = used + 1
                         local prev = n - 1
                         m.Mission = prev
@@ -2845,10 +2932,14 @@ task.spawn(function()
                         -- only the talk that follows a finished training is "the next quest" (a talk that retries a failed training must not be checked)
                         local wantCheck = m.QuestCheck.Enabled and m.Mission >= 2 and m.Mission <= 4 and m.Mission == (T3.completed or 0) + 1
                         local fpBefore, fpWhy
-                        if wantCheck then fpBefore, fpWhy = T3.questFingerprint() end
+                        local wideBefore
+                        if wantCheck then
+                            fpBefore, fpWhy = T3.questFingerprint()
+                            wideBefore = T3.wideSnapshot()
+                        end
                         local ok = pcall(function() remote:FireServer(LocalPlayer) end)
                         if ok then
-                            T3.pendingCheck = wantCheck and { mission = m.Mission, before = fpBefore, why = fpWhy } or nil
+                            T3.pendingCheck = wantCheck and { mission = m.Mission, before = fpBefore, why = fpWhy, wide = wideBefore } or nil
                             local tagMission = m.Mission
                             task.delay(2, function() pcall(T3.questSnapshot, "2 s after talking, hub training " .. tagMission) end)
                             phase, presses = (m.Mission == 2 and "t2") or ((m.Mission == 3 or m.Mission == 4) and "t3") or (m.Mission == 5 and "t5wait") or "m1", 0
